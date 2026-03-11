@@ -3,3 +3,6 @@ data/
 
 # macOS .DS_Store files
 .DS_Store
+
+# Python caches directories
+__pycache__/
