@@ -1,0 +1,9 @@
+numpy
+torch
+pandas
+fastparquet
+tqdm
+PyYAML
+matplotlib
+tiktoken
+xformers

@@ -1,0 +1,7 @@
+name: tiny_language_model
+channels:
+  - defaults
+dependencies:
+  - pip
+  - pip:
+      - -r requirements.txt
