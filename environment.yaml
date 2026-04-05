@@ -1,7 +1,8 @@
-name: tiny_language_model
+name: friendsbot
 channels:
   - defaults
 dependencies:
   - pip
   - pip:
+      - -r requirements-dev.txt
       - -r requirements.txt

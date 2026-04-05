@@ -6,3 +6,9 @@ data/
 
 # Python caches directories
 __pycache__/
+
+# Unit test fixtures
+test/fixtures/
+
+# VS Code local configs
+.vscode/

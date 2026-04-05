@@ -1,4 +1,4 @@
-from typing import Tuple, Dict, Union
+from typing import Union
 import random
 import torch
 from torch import nn
@@ -7,8 +7,9 @@ from torch.nn import functional as F
 def get_supported_weights_precision(device: torch.device):
     if device.type == "cuda" and torch.cuda.is_bf16_supported():
         return torch.bfloat16
-    else:
+    if device.type == "cuda":
         return torch.float16
+    return torch.float32
 
 class RMSNorm(nn.Module):
     def __init__(self,
@@ -58,17 +59,17 @@ class GroupedQueryAttention(nn.Module):
                    rope_cos: torch.Tensor,
                    rope_sin: torch.Tensor,
                    offset: int):
-    
+        rope_slice = slice(offset, offset + x.shape[-2])
         inv_x2 = x[..., ::2]     # (B, G, H // G, T or 1, HS)
         inv_x1 = -x[..., 1::2]
         x_rot = torch.stack((inv_x1, inv_x2), dim=-1).flatten(-2)
 
-        return (x * rope_cos[:, :, :, offset:, :]) + (x_rot * rope_sin[:, :, :, offset:, :])
+        return (x * rope_cos[:, :, :, rope_slice, :]) + (x_rot * rope_sin[:, :, :, rope_slice, :])
 
     def forward(self,
                 embeddings: torch.Tensor,
                 mask: torch.Tensor,
-                kv_cache: Union[Dict[int, Tuple[torch.Tensor, torch.Tensor]], None],
+                kv_cache: Union[dict[int, tuple[torch.Tensor, torch.Tensor]], None],
                 rope_cos: torch.Tensor,
                 rope_sin: torch.Tensor):
 
@@ -107,10 +108,9 @@ class GroupedQueryAttention(nn.Module):
         # weights = F.softmax(logits, dim=-1)
         # outputs = torch.matmul(weights, v)
         # ==================================
-        # TODO: Fix error with mask in eval mode
-        breakpoint()
         outputs = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
-        y = self.output_proj(outputs.view(B, T, self.embedding_dim))
+        outputs = outputs.permute(0, 3, 1, 2, 4).contiguous().view(B, T, self.embedding_dim)
+        y = self.output_proj(outputs)
 
         return y
     
@@ -139,26 +139,28 @@ class SwiGLU(nn.Module):
 
     
 class TransformerDecoder(nn.Module):
+    casual_mask: torch.Tensor
+    rope_freqs: torch.Tensor
+    rope_cos: torch.Tensor
+    rope_sin: torch.Tensor
+
     def __init__(self,
                  n_blocks: int,
                  sequence_length: int,
                  embedding_dim: int,
                  n_heads: int,
                  n_kv_heads: int,
-                 kv_cache: Dict[int, Tuple[torch.Tensor]],
+                 kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
                  device: torch.device):
         super().__init__()
-        if self.training:
-            mask_shape = (1, 1, 1, sequence_length, sequence_length)
-            self.register_buffer("casual_mask",
-                                torch.triu(torch.full(mask_shape,
-                                                    -torch.inf,
-                                                    device=device,
-                                                    dtype=get_supported_weights_precision(device)),
-                                            diagonal=1))
-        else:
-            self.casual_mask = None
+        mask_shape = (1, 1, 1, sequence_length, sequence_length)
+        self.register_buffer("casual_mask",
+                             torch.triu(torch.full(mask_shape,
+                                                   -torch.inf,
+                                                   device=device,
+                                                   dtype=get_supported_weights_precision(device)),
+                                        diagonal=1))
         self.kv_cache = kv_cache
         self.dropout_rate = dropout_rate
         self.n_blocks = n_blocks
@@ -203,7 +205,7 @@ class TransformerDecoder(nn.Module):
 
     def build_rope_sin_cos(self,
                            dtype: torch.dtype,
-                           use_gqa: bool = True):
+                           use_gqa: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
 
         assert self.head_size % 2 == 0
 
@@ -232,7 +234,7 @@ class TransformerDecoder(nn.Module):
 
     def extend_rope_sin_cos(self,
                             extend_token_pos: int,
-                            use_gqa: bool = True):
+                            use_gqa: bool = True) -> None:
         # During inference, if we are generating one token at time, in an
         # autoregressive mode, we need to compute new RoPE sin and cos.
         # (HS / 2)
@@ -256,27 +258,31 @@ class TransformerDecoder(nn.Module):
     def forward(self, x: torch.Tensor):
         # x -> (B, T, D)
         _, T, _ = x.shape
+        mask = self.casual_mask[:, :, :, :T, :T]
         if not self.training:
             self.global_token_counter += T
 
             # If we are in the case of autoregressive generation
             if self.global_token_counter > self.sequence_length:
-                self.extend_rope_sin_cos(self.global_token_counter,
+                self.extend_rope_sin_cos(self.global_token_counter - 1,
                                          use_gqa=True)
+            if self.kv_cache:
+                total_tokens = min(self.global_token_counter, self.sequence_length)
+                mask = self.casual_mask[:, :, :, total_tokens - T:total_tokens, :total_tokens]
 
         for i in range(self.n_blocks):
             attn_out = self.attentions[i](
                 self.norms_1[i](x),
-                self.casual_mask,
+                mask,
                 self.kv_cache,
                 self.rope_cos,
                 self.rope_sin
             )
 
-            x += F.dropout(attn_out, self.dropout_rate) # (B, T, D)
+            x += F.dropout(attn_out, self.dropout_rate, training=self.training) # (B, T, D)
 
             ffn_out = self.ffns[i](self.norms_2[i](x))
-            x += F.dropout(ffn_out, self.dropout_rate)
+            x += F.dropout(ffn_out, self.dropout_rate, training=self.training)
 
         return x # (B, T, D)
     
@@ -288,7 +294,7 @@ class LanguageModel(nn.Module):
                  embedding_dim: int,
                  n_heads: int,
                  n_kv_heads: int,
-                 kv_cache: Dict[int, Tuple[torch.Tensor]],
+                 kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
                  device: torch.device):
         super().__init__()
@@ -314,7 +320,7 @@ class LanguageModel(nn.Module):
             device=device
         )
         
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         tokens = x                                 # (B, T)
         embeddings = self.embedding_matrix(tokens) # (B, T, D)
         out = self.transformer_decoder(embeddings) # (B, T, D)
@@ -335,7 +341,7 @@ if __name__ == "__main__":
     n_heads = 4
     n_kv_heads = 2
     dropout_rate = 0.1
-    kv_cache = {}
+    kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     supported_dtype = get_supported_weights_precision(device)
 
@@ -357,9 +363,9 @@ if __name__ == "__main__":
     # torch.compile
     # language_model = torch.compile(language_model)
     
-    batch_of_tokens = []
+    batch_of_tokens: list[list[int]] = []
     for _ in range(batch_size):
-        sequence = []
+        sequence: list[int] = []
         for _ in range(sequence_length):
             sequence.append(random.randint(0, vocab_size - 1))
 
@@ -373,12 +379,12 @@ if __name__ == "__main__":
     inputs = torch.tensor(batch_of_tokens, dtype=torch.long) # (B, T)
     targets = inputs.clone()
 
-    dataloader = [
+    dataloader: list[tuple[torch.Tensor, torch.Tensor]] = [
         (inputs, targets),
         (new_token, new_token_target)
     ]
 
-    scaler = torch.amp.GradScaler(device)
+    scaler = torch.amp.GradScaler(device.type)
 
 
     for inputs, targets in dataloader:

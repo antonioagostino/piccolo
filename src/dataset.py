@@ -1,13 +1,14 @@
-from typing import List, Tuple
+from collections.abc import Generator
 from pathlib import Path
+from typing import Union
 import random
 import pandas as pd
 import torch
-from tokenizer import Tokenizer, TiktokenTokenizer
+from src.tokenizer import Tokenizer, TiktokenTokenizer
 
 
-def load_text_from_parquet_file(dataset_file_path: str,
-                                raw_texts_column_name: str) -> List[str]:
+def load_text_from_parquet_file(dataset_file_path: Union[str, Path],
+                                raw_texts_column_name: str) -> list[str]:
     """
     A utility function for loading raw texts from a Parquet file.
     Args:
@@ -53,14 +54,14 @@ class PreTrainingDataset:
         self.tokenizer = tokenizer
         self.device = device
         
-        self.tokens_buffer = {
+        self.tokens_buffer: dict[str, list[int]] = {
             "train": [],
             "val": []
         }
         self.training_data_finished = False
         self.__tokens_generator = self.__get_tokenized_splits()
 
-    def __get_tokenized_splits(self):
+    def __get_tokenized_splits(self) -> Generator[tuple[list[int], list[int]], None, None]:
         """
         A generator function that iterates through the sub-directories 
         of the given main directory. For every subdir and files inside the
@@ -104,8 +105,8 @@ class PreTrainingDataset:
                     for text in raw_texts:
                         tokenized_texts.append(self.tokenizer.encode(text))
 
-                    train_tokenized: List[List[int]] = tokenized_texts[:int(len(tokenized_texts) * self.train_split_size)]
-                    val_tokenized: List[List[int]] = tokenized_texts[int(len(tokenized_texts) * self.train_split_size):]
+                    train_tokenized: list[list[int]] = tokenized_texts[:int(len(tokenized_texts) * self.train_split_size)]
+                    val_tokenized: list[list[int]] = tokenized_texts[int(len(tokenized_texts) * self.train_split_size):]
 
                     # We do not need raw texts anymore
                     del raw_texts
@@ -126,7 +127,7 @@ class PreTrainingDataset:
                     raise ValueError(f"Pretraining file's extension under directory '{pre_training_dataset_dir.stem}' do not match the\
                                     correct extension mapping: {pre_training_datasets_extensions[pre_training_dataset_dir.stem]}")
 
-    def __check_buffer_size(self, buffer_type: str):
+    def __check_buffer_size(self, buffer_type: str) -> bool:
         """
         A simple utility function for checking if the train or validation token buffers
         are great enough to contruct a batch of token sequences for the next training 
@@ -137,7 +138,7 @@ class PreTrainingDataset:
         assert buffer_type in ["train", "val"], f"Buffer type must be equal to 'train' or 'val'"
         return len(self.tokens_buffer[buffer_type]) >= self.batch_size + self.sequence_length
     
-    def __fill_tokens_buffers(self):
+    def __fill_tokens_buffers(self) -> None:
         while not self.__check_buffer_size("train") or not self.__check_buffer_size("val"):
             try:
                 train_buffer, val_buffer = next(self.__tokens_generator)
@@ -149,7 +150,7 @@ class PreTrainingDataset:
 
 
     def get_batch(self,
-                  split: str) -> Tuple[torch.Tensor, torch.Tensor]:
+                  split: str) -> tuple[torch.Tensor, torch.Tensor]:
         """
         A fuction that prepares the batch of token sequences pulling them from the
         training or validation token buffers
@@ -163,8 +164,8 @@ class PreTrainingDataset:
         if self.training_data_finished and not self.__check_buffer_size(split):
             raise StopIteration
 
-        x = []
-        y = []
+        x: list[torch.Tensor] = []
+        y: list[torch.Tensor] = []
         for _ in range(self.batch_size):
             sequence = self.tokens_buffer[split][:self.sequence_length]
             sequence_shifted = self.tokens_buffer[split][1:self.sequence_length + 1]
@@ -178,7 +179,7 @@ class PreTrainingDataset:
 if __name__ == "__main__":
     pre_training_data_path = "./data/raw_text/"
     tokenizer = TiktokenTokenizer()
-    device = torch.device("gpu") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     pre_training_dataset = PreTrainingDataset(pre_training_data_path,
                                               8,
                                               0.9,
