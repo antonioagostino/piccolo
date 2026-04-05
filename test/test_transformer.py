@@ -1,8 +1,9 @@
 import copy
+from pathlib import Path
 
 import torch
 
-from src.transformer import GroupedQueryAttention, LanguageModel, RMSNorm
+from src.transformer import GroupedQueryAttention, LanguageModel, ModelConfig, RMSNorm
 
 
 def build_language_model(kv_cache=None):
@@ -13,6 +14,7 @@ def build_language_model(kv_cache=None):
         embedding_dim=16,
         n_heads=4,
         n_kv_heads=2,
+        ffn_hidden_dim=64,
         kv_cache={} if kv_cache is None else kv_cache,
         dropout_rate=0.0,
         device=torch.device("cpu"),
@@ -64,6 +66,51 @@ def test_language_model_forward_returns_vocab_logits():
 
     assert logits.shape == (2, 6, model.vocab_size)
     assert torch.isfinite(logits).all()
+
+
+def test_model_config_loads_from_yaml(tmp_path: Path):
+    config_path = tmp_path / "model.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  vocab_size: 64",
+                "  sequence_length: 16",
+                "  embedding_dim: 32",
+                "  n_decoder_blocks: 3",
+                "  n_heads: 4",
+                "  n_kv_heads: 2",
+                "  ffn_hidden_dim: 96",
+                "  dropout_rate: 0.15",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = ModelConfig.from_yaml(config_path)
+
+    assert config.vocab_size == 64
+    assert config.sequence_length == 16
+    assert config.resolved_ffn_hidden_dim == 96
+
+
+def test_language_model_can_be_built_from_config():
+    config = ModelConfig(
+        vocab_size=64,
+        sequence_length=16,
+        embedding_dim=32,
+        n_decoder_blocks=3,
+        n_heads=4,
+        n_kv_heads=2,
+        ffn_hidden_dim=96,
+        dropout_rate=0.15,
+    )
+
+    model = LanguageModel.from_config(config, kv_cache={}, device=torch.device("cpu"))
+
+    assert model.vocab_size == config.vocab_size
+    assert model.embedding_dim == config.embedding_dim
+    assert model.transformer_decoder.ffn_hidden_dim == config.ffn_hidden_dim
 
 
 def test_cached_autoregressive_step_matches_full_forward_last_token():

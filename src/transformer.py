@@ -1,8 +1,63 @@
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Union
 import random
 import torch
 from torch import nn
 from torch.nn import functional as F
+import yaml
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    vocab_size: int
+    sequence_length: int
+    embedding_dim: int
+    n_decoder_blocks: int
+    n_heads: int
+    n_kv_heads: int
+    dropout_rate: float = 0.0
+    ffn_hidden_dim: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.vocab_size <= 0:
+            raise ValueError("vocab_size must be greater than 0")
+        if self.sequence_length <= 0:
+            raise ValueError("sequence_length must be greater than 0")
+        if self.embedding_dim <= 0:
+            raise ValueError("embedding_dim must be greater than 0")
+        if self.n_decoder_blocks <= 0:
+            raise ValueError("n_decoder_blocks must be greater than 0")
+        if self.n_heads <= 0:
+            raise ValueError("n_heads must be greater than 0")
+        if self.n_kv_heads <= 0:
+            raise ValueError("n_kv_heads must be greater than 0")
+        if self.embedding_dim % self.n_heads != 0:
+            raise ValueError("embedding_dim must be divisible by n_heads")
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads")
+        if not 0.0 <= self.dropout_rate <= 1.0:
+            raise ValueError("dropout_rate must be between 0 and 1")
+        if self.ffn_hidden_dim is not None and self.ffn_hidden_dim <= 0:
+            raise ValueError("ffn_hidden_dim must be greater than 0")
+
+    @property
+    def resolved_ffn_hidden_dim(self) -> int:
+        return self.ffn_hidden_dim if self.ffn_hidden_dim is not None else 4 * self.embedding_dim
+
+    @classmethod
+    def from_yaml(cls, config_path: Union[str, Path]) -> "ModelConfig":
+        with Path(config_path).open("r", encoding="utf-8") as config_file:
+            raw_config = yaml.safe_load(config_file)
+
+        if not isinstance(raw_config, dict):
+            raise ValueError("The model configuration file must contain a YAML mapping")
+
+        model_section = raw_config.get("model", raw_config)
+        if not isinstance(model_section, dict):
+            raise ValueError("The 'model' section must contain a YAML mapping")
+
+        return cls(**model_section)
 
 def get_supported_weights_precision(device: torch.device):
     if device.type == "cuda" and torch.cuda.is_bf16_supported():
@@ -150,6 +205,7 @@ class TransformerDecoder(nn.Module):
                  embedding_dim: int,
                  n_heads: int,
                  n_kv_heads: int,
+                 ffn_hidden_dim: int | None,
                  kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
                  device: torch.device):
@@ -167,6 +223,7 @@ class TransformerDecoder(nn.Module):
         self.device = device
         self.sequence_length = sequence_length
         self.head_size = embedding_dim // n_heads
+        self.ffn_hidden_dim = ffn_hidden_dim if ffn_hidden_dim is not None else 4 * embedding_dim
         self.global_token_counter = 0
         # TODO: Add scaling RoPE for supporting long contexts
         rope_cos, rope_sin = self.build_rope_sin_cos(dtype=get_supported_weights_precision(device),
@@ -199,7 +256,7 @@ class TransformerDecoder(nn.Module):
 
         self.ffns = nn.ModuleList(
             [SwiGLU(embedding_dim,
-                    4 * embedding_dim) 
+                    self.ffn_hidden_dim) 
             for _ in range(n_blocks)]
         )
 
@@ -294,6 +351,7 @@ class LanguageModel(nn.Module):
                  embedding_dim: int,
                  n_heads: int,
                  n_kv_heads: int,
+                 ffn_hidden_dim: int | None,
                  kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
                  device: torch.device):
@@ -310,6 +368,7 @@ class LanguageModel(nn.Module):
             embedding_dim=embedding_dim,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
+            ffn_hidden_dim=ffn_hidden_dim,
             kv_cache=kv_cache,
             dropout_rate=dropout_rate,
             device=device
@@ -332,30 +391,32 @@ class LanguageModel(nn.Module):
 
         return logits
 
+    @classmethod
+    def from_config(cls,
+                    config: ModelConfig,
+                    kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
+                    device: torch.device) -> "LanguageModel":
+        return cls(
+            n_decoder_blocks=config.n_decoder_blocks,
+            sequence_length=config.sequence_length,
+            vocab_size=config.vocab_size,
+            embedding_dim=config.embedding_dim,
+            n_heads=config.n_heads,
+            n_kv_heads=config.n_kv_heads,
+            ffn_hidden_dim=config.resolved_ffn_hidden_dim,
+            kv_cache=kv_cache,
+            dropout_rate=config.dropout_rate,
+            device=device,
+        )
+
 if __name__ == "__main__":
-    vocab_size = 20
-    embedding_dim = 8
     batch_size = 1
-    sequence_length = 4
-    n_decoder_blocks = 4
-    n_heads = 4
-    n_kv_heads = 2
-    dropout_rate = 0.1
+    config = ModelConfig.from_yaml(Path(__file__).resolve().parents[1] / "configs" / "model.yaml")
     kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     supported_dtype = get_supported_weights_precision(device)
 
-    language_model = LanguageModel(
-        n_decoder_blocks=n_decoder_blocks,
-        sequence_length=sequence_length,
-        vocab_size=vocab_size,
-        embedding_dim=embedding_dim,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        kv_cache=kv_cache,
-        dropout_rate=dropout_rate,
-        device=device
-    )
+    language_model = LanguageModel.from_config(config, kv_cache=kv_cache, device=device)
 
     language_model.eval()
 
@@ -366,13 +427,13 @@ if __name__ == "__main__":
     batch_of_tokens: list[list[int]] = []
     for _ in range(batch_size):
         sequence: list[int] = []
-        for _ in range(sequence_length):
-            sequence.append(random.randint(0, vocab_size - 1))
+        for _ in range(config.sequence_length):
+            sequence.append(random.randint(0, config.vocab_size - 1))
 
         batch_of_tokens.append(sequence)
 
 
-    new_token = torch.tensor([[random.randint(0, vocab_size - 1)]], dtype=torch.long) # (B=1, T=1)
+    new_token = torch.tensor([[random.randint(0, config.vocab_size - 1)]], dtype=torch.long) # (B=1, T=1)
     new_token_target = new_token.clone()
         
 

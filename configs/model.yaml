@@ -1,0 +1,9 @@
+model:
+  vocab_size: 32000
+  sequence_length: 512
+  embedding_dim: 512
+  n_decoder_blocks: 8
+  n_heads: 8
+  n_kv_heads: 4
+  ffn_hidden_dim: 2048
+  dropout_rate: 0.1
