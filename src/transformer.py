@@ -415,6 +415,8 @@ if __name__ == "__main__":
     kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     supported_dtype = get_supported_weights_precision(device)
+    use_amp = device.type == "cuda"
+    use_grad_scaler = use_amp and supported_dtype == torch.float16
 
     language_model = LanguageModel.from_config(config, kv_cache=kv_cache, device=device)
 
@@ -445,22 +447,21 @@ if __name__ == "__main__":
         (new_token, new_token_target)
     ]
 
-    scaler = torch.amp.GradScaler(device.type)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
 
 
     for inputs, targets in dataloader:
         inputs, targets = inputs.to(device), targets.to(device)
         # TODO: Put optimizer here
 
-        with torch.autocast(device_type=device.type, dtype=supported_dtype):
+        with torch.autocast(device_type=device.type, dtype=supported_dtype, enabled=use_amp):
             logits = language_model(inputs)
             print(torch.sum((F.softmax(logits, dim=-1).detach()[0][0])))
             print(kv_cache[0][0].shape)
             # TODO: Put loss here
 
-        # If bfloat16 is not supported it scales the loss and then
-        # backprops gradients, otherwise (bfloat16 supported), it
-        # calls the standard backward method.
+        # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
+        # GradScaler is disabled and these calls become no-ops/pass-throughs.
         # TODO: scaler.scale(loss).backward()
         
         # Gradient clipping
