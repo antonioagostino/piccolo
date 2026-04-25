@@ -7,3 +7,4 @@ PyYAML
 matplotlib
 tiktoken
 xformers
+wandb

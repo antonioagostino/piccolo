@@ -509,4 +509,4 @@ if __name__ == "__main__":
             use_amp=use_amp,
             max_grad_norm=1.0
         )
-        print(f"training loss: {loss:.4f}")
+        print(f"Training loss: {loss:.4f}")

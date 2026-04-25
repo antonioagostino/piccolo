@@ -1,0 +1,21 @@
+training:
+  data_dir: ./data
+  model_config: ./configs/model.yaml
+  tokenizer_encoding: cl100k_base
+  train_split_size: 0.9
+  batch_size: 4
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  lr_warmup_iterations: 100
+  max_iterations: 10000
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  device: auto
+  compile_model: false
+  seed: 42
+  log_every_tokens: 2048
+  wandb:
+    enabled: true
+    project: friendbots
+    run_name: null
+    mode: online

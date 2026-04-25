@@ -1,5 +1,5 @@
 model:
-  vocab_size: 32000
+  vocab_size: 100277
   sequence_length: 512
   embedding_dim: 512
   n_decoder_blocks: 8
