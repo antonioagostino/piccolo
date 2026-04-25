@@ -1,5 +1,5 @@
 numpy
-torch
+torch>=2.10.0
 pandas
 fastparquet
 tqdm

@@ -3,7 +3,15 @@ from pathlib import Path
 
 import torch
 
-from src.transformer import GroupedQueryAttention, LanguageModel, ModelConfig, RMSNorm
+from src.transformer import (
+    GroupedQueryAttention,
+    LanguageModel,
+    ModelConfig,
+    RMSNorm,
+    get_supported_weights_precision,
+    language_model_loss,
+    training_step,
+)
 
 
 def build_language_model(kv_cache=None):
@@ -66,6 +74,43 @@ def test_language_model_forward_returns_vocab_logits():
 
     assert logits.shape == (2, 6, model.vocab_size)
     assert torch.isfinite(logits).all()
+
+
+def test_language_model_loss_returns_scalar():
+    model = build_language_model()
+    tokens = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
+    targets = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
+
+    logits = model(tokens)
+    loss = language_model_loss(logits, targets)
+
+    assert loss.shape == torch.Size([])
+    assert torch.isfinite(loss)
+
+
+def test_training_step_updates_model_parameters():
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    model = build_language_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler(device.type, enabled=False)
+    tokens = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
+    targets = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
+    initial_embedding = model.embedding_matrix.weight.detach().clone()
+
+    loss = training_step(
+        language_model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        inputs=tokens,
+        targets=targets,
+        device=device,
+        amp_dtype=get_supported_weights_precision(device),
+        use_amp=False,
+    )
+
+    assert loss > 0
+    assert not torch.equal(initial_embedding, model.embedding_matrix.weight)
 
 
 def test_model_config_loads_from_yaml(tmp_path: Path):

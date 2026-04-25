@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Union, cast
 import random
 import torch
 from torch import nn
@@ -65,6 +65,52 @@ def get_supported_weights_precision(device: torch.device):
     if device.type == "cuda":
         return torch.float16
     return torch.float32
+
+
+def language_model_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1)
+    )
+
+
+def training_step(
+    language_model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    max_grad_norm: float | None = 1.0
+) -> float:
+    language_model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    inputs, targets = inputs.to(device), targets.to(device)
+    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+        logits = language_model(inputs)
+        loss = language_model_loss(logits, targets)
+
+    # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
+    # GradScaler is disabled and these calls become no-ops/pass-throughs.
+    scaler.scale(loss).backward()
+
+    if max_grad_norm is not None:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=max_grad_norm)
+
+    scaler.step(optimizer)
+    scaler.update()
+
+    return float(loss.detach().item())
+
+
+def compile_language_model(language_model: nn.Module, enabled: bool) -> nn.Module:
+    if enabled:
+        return cast(nn.Module, torch.compile(language_model))
+    return language_model
 
 class RMSNorm(nn.Module):
     def __init__(self,
@@ -336,10 +382,10 @@ class TransformerDecoder(nn.Module):
                 self.rope_sin
             )
 
-            x += F.dropout(attn_out, self.dropout_rate, training=self.training) # (B, T, D)
+            x = x + F.dropout(attn_out, self.dropout_rate, training=self.training) # (B, T, D)
 
             ffn_out = self.ffns[i](self.norms_2[i](x))
-            x += F.dropout(ffn_out, self.dropout_rate, training=self.training)
+            x = x + F.dropout(ffn_out, self.dropout_rate, training=self.training)
 
         return x # (B, T, D)
     
@@ -418,29 +464,30 @@ if __name__ == "__main__":
     use_amp = device.type == "cuda"
     use_grad_scaler = use_amp and supported_dtype == torch.float16
 
-    language_model = LanguageModel.from_config(config, kv_cache=kv_cache, device=device)
+    language_model: nn.Module = LanguageModel.from_config(config, kv_cache=kv_cache, device=device).to(device)
+    optimizer = torch.optim.AdamW(language_model.parameters(), lr=3e-4)
 
-    language_model.eval()
-
-    # TODO: Change Python to a version different from 3.14 to support
-    # torch.compile
-    # language_model = torch.compile(language_model)
+    # Python 3.14 is supported by torch.compile starting from PyTorch 2.10.
+    # Keep compilation opt-in here because the first compile can dominate a tiny
+    # local smoke run; enable it for real training benchmarks.
+    use_compile = False
+    language_model = compile_language_model(language_model, enabled=use_compile)
     
     batch_of_tokens: list[list[int]] = []
     for _ in range(batch_size):
         sequence: list[int] = []
-        for _ in range(config.sequence_length):
+        for _ in range(config.sequence_length + 1):
             sequence.append(random.randint(0, config.vocab_size - 1))
 
         batch_of_tokens.append(sequence)
 
 
     new_token = torch.tensor([[random.randint(0, config.vocab_size - 1)]], dtype=torch.long) # (B=1, T=1)
-    new_token_target = new_token.clone()
+    new_token_target = torch.tensor([[random.randint(0, config.vocab_size - 1)]], dtype=torch.long)
         
 
-    inputs = torch.tensor(batch_of_tokens, dtype=torch.long) # (B, T)
-    targets = inputs.clone()
+    inputs = torch.tensor([sequence[:-1] for sequence in batch_of_tokens], dtype=torch.long) # (B, T)
+    targets = torch.tensor([sequence[1:] for sequence in batch_of_tokens], dtype=torch.long)
 
     dataloader: list[tuple[torch.Tensor, torch.Tensor]] = [
         (inputs, targets),
@@ -451,23 +498,15 @@ if __name__ == "__main__":
 
 
     for inputs, targets in dataloader:
-        inputs, targets = inputs.to(device), targets.to(device)
-        # TODO: Put optimizer here
-
-        with torch.autocast(device_type=device.type, dtype=supported_dtype, enabled=use_amp):
-            logits = language_model(inputs)
-            print(torch.sum((F.softmax(logits, dim=-1).detach()[0][0])))
-            print(kv_cache[0][0].shape)
-            # TODO: Put loss here
-
-        # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
-        # GradScaler is disabled and these calls become no-ops/pass-throughs.
-        # TODO: scaler.scale(loss).backward()
-        
-        # Gradient clipping
-        # TODO: scaler.unscale_(optimizer)
-        # torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=1.0)
-        
-        # TODO: Optimizer step
-        #scaler.step(optimizer)
-        #scaler.update()
+        loss = training_step(
+            language_model=language_model,
+            optimizer=optimizer,
+            scaler=scaler,
+            inputs=inputs,
+            targets=targets,
+            device=device,
+            amp_dtype=supported_dtype,
+            use_amp=use_amp,
+            max_grad_norm=1.0
+        )
+        print(f"training loss: {loss:.4f}")
