@@ -488,7 +488,7 @@ def validate(
     total_tokens = 0
 
     with torch.no_grad():
-        progress = tqdm(desc="validation", unit="token")
+        progress = tqdm(desc="Validation", unit="Token")
         while True:
             try:
                 inputs, targets = pre_training_dataset.get_sequential_batch("val")
@@ -603,7 +603,7 @@ def train(config: TrainingConfig) -> None:
             device,
             random_seed=config.seed,
         )
-        progress = tqdm(desc="training", unit="token")
+        progress = tqdm(desc="Training", unit="Token")
 
         while True:
             try:
