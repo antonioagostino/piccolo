@@ -12,3 +12,6 @@ test/fixtures/
 
 # VS Code local configs
 .vscode/
+
+# Weights and Biases directories
+wandb/

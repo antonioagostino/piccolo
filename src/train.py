@@ -492,7 +492,11 @@ def validate(
     iteration = 0
 
     with torch.no_grad():
-        progress = tqdm(desc="validation", unit="token")
+        progress = tqdm(
+            desc="\033[1mValidation\033[0m",
+            unit=" total tokens",
+            bar_format="{desc}: {n_fmt}{unit} [elapsed: {elapsed}, {rate_fmt}{postfix}]",
+        )
         while True:
             if max_iterations is not None and iteration >= max_iterations:
                 break
@@ -600,10 +604,15 @@ def train(config: TrainingConfig) -> None:
                 use_amp=use_amp,
                 max_iterations=val_iterations if val_iterations > 0 else None,
             )
+
             language_model.train()
             return result
 
-        progress = tqdm(desc="training", unit="token")
+        progress = tqdm(
+            desc="\033[1mTraining\033[0m",
+            unit=" total tokens",
+            bar_format="{desc}: {n_fmt}{unit} [elapsed: {elapsed}, {rate_fmt}{postfix}]",
+        )
 
         while True:
             try:
