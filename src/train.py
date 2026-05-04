@@ -466,9 +466,10 @@ def validate(
     device: torch.device,
     amp_dtype: torch.dtype,
     use_amp: bool,
+    max_iterations: int | None = None,
 ) -> float | None:
     """
-    Run one full validation pass and return the mean per-token loss.
+    Run a validation pass and return the mean per-token loss.
 
     Args:
         language_model (torch.nn.Module): The model to evaluate (set to eval
@@ -478,22 +479,28 @@ def validate(
         device (torch.device): Device that tensors are moved to.
         amp_dtype (torch.dtype): dtype used inside the autocast region.
         use_amp (bool): Whether to enable automatic mixed precision.
+        max_iterations (int | None): Maximum number of batches to evaluate.
+            When None the validation split is consumed fully.
 
     Returns:
-        float | None: Mean per-token cross-entropy loss over the validation
-            split, or None if no validation batches were produced.
+        float | None: Mean per-token cross-entropy loss over the evaluated
+            batches, or None if no validation batches were produced.
     """
     language_model.eval()
     total_token_loss = 0.0
     total_tokens = 0
+    iteration = 0
 
     with torch.no_grad():
         progress = tqdm(desc="validation", unit="token")
         while True:
+            if max_iterations is not None and iteration >= max_iterations:
+                break
             try:
                 inputs, targets = pre_training_dataset.get_sequential_batch("val")
             except StopIteration:
                 break
+            iteration += 1
 
             reset_inference_state(language_model)
             inputs, targets = inputs.to(device), targets.to(device)
@@ -566,27 +573,7 @@ def train(config: TrainingConfig) -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
     logger = build_logger(config, model_config)
 
-    def _make_val_dataset() -> PreTrainingDataset:
-        return PreTrainingDataset(
-            str(data_dir),
-            model_config.sequence_length,
-            config.train_split_size,
-            config.batch_size,
-            tokenizer,
-            device,
-            random_seed=config.seed,
-        )
-
-    def _run_validation() -> float | None:
-        result = validate(
-            language_model=language_model,
-            pre_training_dataset=_make_val_dataset(),
-            device=device,
-            amp_dtype=amp_dtype,
-            use_amp=use_amp,
-        )
-        language_model.train()
-        return result
+    val_iterations = int(config.val_every_iterations * (1 - config.train_split_size))
 
     optimizer_steps = 0
     train_tokens_seen = 0
@@ -603,6 +590,19 @@ def train(config: TrainingConfig) -> None:
             device,
             random_seed=config.seed,
         )
+
+        def _run_validation() -> float | None:
+            result = validate(
+                language_model=language_model,
+                pre_training_dataset=pre_training_dataset,
+                device=device,
+                amp_dtype=amp_dtype,
+                use_amp=use_amp,
+                max_iterations=val_iterations if val_iterations > 0 else None,
+            )
+            language_model.train()
+            return result
+
         progress = tqdm(desc="training", unit="token")
 
         while True:
