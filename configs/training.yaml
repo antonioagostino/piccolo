@@ -14,6 +14,8 @@ training:
   compile_model: false
   seed: 42
   log_every_tokens: 2048
+  val_every_iterations: 500
+  checkpoint_dir: ./checkpoints
   wandb:
     enabled: true
     project: friendbots

@@ -49,6 +49,8 @@ class TrainingConfig:
     compile_model: bool
     seed: int
     log_every_tokens: int
+    val_every_iterations: int
+    checkpoint_dir: Path
     wandb: WandbConfig
 
 
@@ -159,6 +161,8 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "compile_model": config.compile_model,
         "seed": config.seed,
         "log_every_tokens": config.log_every_tokens,
+        "val_every_iterations": config.val_every_iterations,
+        "checkpoint_dir": str(config.checkpoint_dir),
         "wandb": {
             "enabled": config.wandb.enabled,
             "project": config.wandb.project,
@@ -227,6 +231,8 @@ def load_training_config(config_path: Path) -> TrainingConfig:
         compile_model=bool(training.get("compile_model", False)),
         seed=int(training.get("seed", 42)),
         log_every_tokens=int(training.get("log_every_tokens", 2048)),
+        val_every_iterations=int(training.get("val_every_iterations", 500)),
+        checkpoint_dir=Path(training.get("checkpoint_dir", "./checkpoints")),
         wandb=WandbConfig(
             enabled=bool(wandb_config.get("enabled", True)),
             project=str(wandb_config.get("project", "friendbots")),
@@ -268,6 +274,8 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("max_grad_norm must be greater than 0 when configured")
     if config.log_every_tokens <= 0:
         raise ValueError("log_every_tokens must be greater than 0")
+    if config.val_every_iterations <= 0:
+        raise ValueError("val_every_iterations must be greater than 0")
 
 
 def resolve_data_dir(data_dir: Path) -> Path:
@@ -411,6 +419,47 @@ def reset_inference_state(language_model: torch.nn.Module) -> None:
     transformer_decoder.kv_cache.clear()
 
 
+def save_checkpoint(
+    path: Path,
+    language_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    optimizer_steps: int,
+    train_tokens_seen: int,
+    val_loss: float,
+) -> None:
+    """
+    Save a training checkpoint to disk.
+
+    Unwraps compiled models (``_orig_mod``) before saving so the checkpoint
+    contains plain module state and can be loaded without torch.compile.
+
+    Args:
+        path (Path): Destination file path; parent directories are created
+            automatically.
+        language_model (torch.nn.Module): The model whose parameters are saved.
+        optimizer (torch.optim.Optimizer): The optimizer whose state is saved.
+        scaler (torch.amp.GradScaler): The gradient scaler whose state is saved.
+        optimizer_steps (int): Number of optimizer steps completed.
+        train_tokens_seen (int): Total training tokens processed so far.
+        val_loss (float): Validation loss at this checkpoint; use
+            ``float("nan")`` when no validation was run.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    model = getattr(language_model, "_orig_mod", language_model)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "optimizer_steps": optimizer_steps,
+            "train_tokens_seen": train_tokens_seen,
+            "val_loss": val_loss,
+        },
+        path,
+    )
+
+
 def validate(
     language_model: torch.nn.Module,
     pre_training_dataset: PreTrainingDataset,
@@ -517,10 +566,33 @@ def train(config: TrainingConfig) -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
     logger = build_logger(config, model_config)
 
+    def _make_val_dataset() -> PreTrainingDataset:
+        return PreTrainingDataset(
+            str(data_dir),
+            model_config.sequence_length,
+            config.train_split_size,
+            config.batch_size,
+            tokenizer,
+            device,
+            random_seed=config.seed,
+        )
+
+    def _run_validation() -> float | None:
+        result = validate(
+            language_model=language_model,
+            pre_training_dataset=_make_val_dataset(),
+            device=device,
+            amp_dtype=amp_dtype,
+            use_amp=use_amp,
+        )
+        language_model.train()
+        return result
+
     optimizer_steps = 0
     train_tokens_seen = 0
     train_token_loss = 0.0
     next_log_tokens = config.log_every_tokens
+    best_val_loss = float("inf")
     try:
         pre_training_dataset = PreTrainingDataset(
             str(data_dir),
@@ -576,6 +648,29 @@ def train(config: TrainingConfig) -> None:
                 while next_log_tokens <= train_tokens_seen:
                     next_log_tokens += config.log_every_tokens
 
+            if optimizer_steps % config.val_every_iterations == 0:
+                step_val_loss = _run_validation()
+                if step_val_loss is not None:
+                    logger.log(
+                        {
+                            "val/loss": step_val_loss,
+                            "train/tokens_seen": train_tokens_seen,
+                            "train/optimizer_steps": optimizer_steps,
+                        },
+                        step=train_tokens_seen,
+                    )
+                    if step_val_loss < best_val_loss:
+                        best_val_loss = step_val_loss
+                        save_checkpoint(
+                            path=config.checkpoint_dir / f"checkpoint_step_{optimizer_steps}.pt",
+                            language_model=language_model,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                            optimizer_steps=optimizer_steps,
+                            train_tokens_seen=train_tokens_seen,
+                            val_loss=step_val_loss,
+                        )
+
         progress.close()
 
         if train_tokens_seen > 0:
@@ -589,21 +684,26 @@ def train(config: TrainingConfig) -> None:
                 step=train_tokens_seen,
             )
 
-        val_loss = validate(
-            language_model=language_model,
-            pre_training_dataset=pre_training_dataset,
-            device=device,
-            amp_dtype=amp_dtype,
-            use_amp=use_amp,
-        )
-        if val_loss is not None:
+        final_val_loss = _run_validation()
+        if final_val_loss is not None:
             logger.log(
                 {
-                    "val/loss": val_loss,
+                    "val/loss": final_val_loss,
                     "train/tokens_seen": train_tokens_seen,
+                    "train/optimizer_steps": optimizer_steps,
                 },
                 step=max(train_tokens_seen, 1),
             )
+
+        save_checkpoint(
+            path=config.checkpoint_dir / "checkpoint_last.pt",
+            language_model=language_model,
+            optimizer=optimizer,
+            scaler=scaler,
+            optimizer_steps=optimizer_steps,
+            train_tokens_seen=train_tokens_seen,
+            val_loss=final_val_loss if final_val_loss is not None else float("nan"),
+        )
     finally:
         logger.finish()
 
