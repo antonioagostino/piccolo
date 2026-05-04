@@ -16,40 +16,56 @@ class LengthTokenizer(Tokenizer):
     def get_end_token(self) -> int:
         return 0
 
-@pytest.fixture(scope="module")
-def parquet_dataset_file() -> Path:
-    datasets_root_dir = Path("test/fixtures/raw_text/")
-    path = datasets_root_dir / "CulturaX" / "dataset_file.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame({
+
+@pytest.fixture
+def three_text_dataset_dir(tmp_path: Path) -> Path:
+    root = tmp_path / "raw_text"
+    path = root / "CulturaX" / "dataset_file.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame({
         "text": [
             "This is the first text.",
             "This is the second text.",
-            "This is the third text."
+            "This is the third text.",
         ]
-    })
-    df.to_parquet(path, engine="auto", index=False)
-    return datasets_root_dir
+    }).to_parquet(path, engine="auto", index=False)
+    return root
 
-def test_load_text_from_parquet_file(parquet_dataset_file):
-    dataset_file_path = Path(parquet_dataset_file) / "CulturaX" / "dataset_file.parquet"
-    raw_texts = load_text_from_parquet_file(dataset_file_path,
-                                            "text")
+
+@pytest.fixture
+def sequential_dataset_dir(tmp_path: Path) -> Path:
+    root = tmp_path / "raw_text"
+    path = root / "CulturaX" / "dataset_file.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame({"text": ["abcdefghij"]}).to_parquet(path, engine="auto", index=False)
+    return root
+
+
+@pytest.fixture
+def token_count_dataset_dir(tmp_path: Path) -> Path:
+    root = tmp_path / "raw_text"
+    path = root / "CulturaX" / "dataset_file.parquet"
+    path.parent.mkdir(parents=True)
+    pd.DataFrame({"text": ["abc", "def", "ghi"]}).to_parquet(path, engine="auto", index=False)
+    return root
+
+
+def test_load_text_from_parquet_file(three_text_dataset_dir: Path):
+    parquet_path = three_text_dataset_dir / "CulturaX" / "dataset_file.parquet"
+    raw_texts = load_text_from_parquet_file(parquet_path, "text")
     assert len(raw_texts) > 0
 
-def test_pre_training_dataset(parquet_dataset_file):
-    tokenizer = TiktokenTokenizer()
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    sequence_length = 6
-    train_split = 0.67
-    batch_size = 1
-    pre_training_dataset = PreTrainingDataset(parquet_dataset_file,
-                                              sequence_length,
-                                              train_split,
-                                              batch_size,
-                                              tokenizer,
-                                              device
-                                              )
+
+def test_pre_training_dataset(three_text_dataset_dir: Path):
+    pre_training_dataset = PreTrainingDataset(
+        str(three_text_dataset_dir),
+        sequence_length=6,
+        train_split_size=0.67,
+        batch_size=1,
+        tokenizer=TiktokenTokenizer(),
+        device=torch.device("cpu"),
+    )
+
     dataset = []
     x, y = pre_training_dataset.get_batch("train")
     dataset.append((x, y))
@@ -62,19 +78,14 @@ def test_pre_training_dataset(parquet_dataset_file):
         assert torch.equal(x[:, 1:], y[:, :-1])
 
 
-def test_sequential_batch_advances_by_sequence_length(tmp_path: Path):
-    datasets_root_dir = tmp_path / "raw_text"
-    path = datasets_root_dir / "CulturaX" / "dataset_file.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame({"text": ["abcdefghij"]})
-    df.to_parquet(path, engine="auto", index=False)
+def test_sequential_batch_advances_by_sequence_length(sequential_dataset_dir: Path):
     pre_training_dataset = PreTrainingDataset(
-        str(datasets_root_dir),
+        str(sequential_dataset_dir),
         sequence_length=3,
         train_split_size=1.0,
         batch_size=2,
         tokenizer=LengthTokenizer(),
-        device=torch.device("cpu")
+        device=torch.device("cpu"),
     )
 
     x, y = pre_training_dataset.get_sequential_batch("train")
@@ -83,15 +94,9 @@ def test_sequential_batch_advances_by_sequence_length(tmp_path: Path):
     assert torch.equal(y, torch.tensor([[2, 3, 4], [5, 6, 7]]))
 
 
-def test_count_pre_training_tokens_matches_dataset_split(tmp_path: Path):
-    datasets_root_dir = tmp_path / "raw_text"
-    path = datasets_root_dir / "CulturaX" / "dataset_file.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame({"text": ["abc", "def", "ghi"]})
-    df.to_parquet(path, engine="auto", index=False)
-
+def test_count_pre_training_tokens_matches_dataset_split(token_count_dataset_dir: Path):
     counts = count_pre_training_tokens(
-        str(datasets_root_dir),
+        str(token_count_dataset_dir),
         train_split_size=2 / 3,
         tokenizer=LengthTokenizer(),
         random_seed=0,

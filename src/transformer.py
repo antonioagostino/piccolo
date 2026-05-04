@@ -10,6 +10,22 @@ import yaml
 
 @dataclass(frozen=True)
 class ModelConfig:
+    """
+    Hyperparameter configuration for the language model architecture.
+
+    Attributes:
+        vocab_size (int): Number of tokens in the vocabulary.
+        sequence_length (int): Maximum context length in tokens.
+        embedding_dim (int): Residual stream / embedding dimension D.
+        n_decoder_blocks (int): Number of stacked transformer decoder blocks.
+        n_heads (int): Number of query attention heads.
+        n_kv_heads (int): Number of key/value heads (GQA; must divide n_heads).
+        dropout_rate (float): Dropout probability applied to attention and FFN
+            outputs.
+        ffn_hidden_dim (int | None): Hidden dimension of the SwiGLU FFN. If
+            None, defaults to 4 × embedding_dim.
+    """
+
     vocab_size: int
     sequence_length: int
     embedding_dim: int
@@ -20,6 +36,13 @@ class ModelConfig:
     ffn_hidden_dim: int | None = None
 
     def __post_init__(self) -> None:
+        """
+        Validate that all field values are internally consistent.
+
+        Raises:
+            ValueError: If any field violates its constraint (e.g. non-positive
+                dimensions, incompatible head counts, out-of-range dropout).
+        """
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be greater than 0")
         if self.sequence_length <= 0:
@@ -43,10 +66,33 @@ class ModelConfig:
 
     @property
     def resolved_ffn_hidden_dim(self) -> int:
+        """
+        FFN hidden dimension, falling back to 4 × embedding_dim when unset.
+
+        Returns:
+            int: The effective hidden dimension of the SwiGLU feed-forward
+                block.
+        """
         return self.ffn_hidden_dim if self.ffn_hidden_dim is not None else 4 * self.embedding_dim
 
     @classmethod
     def from_yaml(cls, config_path: Union[str, Path]) -> "ModelConfig":
+        """
+        Load a ModelConfig from a YAML file.
+
+        The YAML file may contain either a top-level ``model`` key whose value
+        is the config mapping, or the mapping at the root level.
+
+        Args:
+            config_path (str | Path): Path to the YAML configuration file.
+
+        Returns:
+            ModelConfig: The parsed model configuration.
+
+        Raises:
+            ValueError: If the file does not contain a valid YAML mapping or
+                the ``model`` section is missing or malformed.
+        """
         with Path(config_path).open("r", encoding="utf-8") as config_file:
             raw_config = yaml.safe_load(config_file)
 
@@ -59,7 +105,17 @@ class ModelConfig:
 
         return cls(**model_section)
 
-def get_supported_weights_precision(device: torch.device):
+def get_supported_weights_precision(device: torch.device) -> torch.dtype:
+    """
+    Return the highest-precision dtype supported for AMP on the given device.
+
+    Args:
+        device (torch.device): The target compute device.
+
+    Returns:
+        torch.dtype: bfloat16 on CUDA if supported, float16 on other CUDA
+            devices, float32 on CPU.
+    """
     if device.type == "cuda" and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     if device.type == "cuda":
@@ -68,6 +124,16 @@ def get_supported_weights_precision(device: torch.device):
 
 
 def language_model_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """
+    Compute cross-entropy loss over a batch of next-token predictions.
+
+    Args:
+        logits (torch.Tensor): Raw model output of shape (B, T, vocab_size).
+        targets (torch.Tensor): Ground-truth token IDs of shape (B, T).
+
+    Returns:
+        torch.Tensor: Scalar mean cross-entropy loss.
+    """
     return F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         targets.reshape(-1)
@@ -85,6 +151,26 @@ def training_step(
     use_amp: bool,
     max_grad_norm: float | None = 1.0
 ) -> float:
+    """
+    Run one forward-backward-optimizer step with AMP support.
+
+    Args:
+        language_model (nn.Module): The model being trained.
+        optimizer (torch.optim.Optimizer): Optimizer holding the parameter
+            groups.
+        scaler (torch.amp.GradScaler): Gradient scaler for mixed-precision
+            training.
+        inputs (torch.Tensor): Input token IDs of shape (B, T).
+        targets (torch.Tensor): Target token IDs of shape (B, T).
+        device (torch.device): Device that tensors are moved to.
+        amp_dtype (torch.dtype): dtype used inside the autocast region.
+        use_amp (bool): Whether to enable automatic mixed precision.
+        max_grad_norm (float | None): Maximum gradient norm for clipping.
+            Pass None to disable clipping.
+
+    Returns:
+        float: The scalar training loss for this step.
+    """
     language_model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -108,15 +194,40 @@ def training_step(
 
 
 def compile_language_model(language_model: nn.Module, enabled: bool) -> nn.Module:
+    """
+    Optionally compile the model with torch.compile for faster execution.
+
+    Args:
+        language_model (nn.Module): The model to (optionally) compile.
+        enabled (bool): If True, applies torch.compile; otherwise returns
+            the model unchanged.
+
+    Returns:
+        nn.Module: The compiled or original model.
+    """
     if enabled:
         return cast(nn.Module, torch.compile(language_model))
     return language_model
 
 class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalisation (no mean-subtraction)."""
+
     def __init__(self,
                  feature_size: int,
                  device: torch.device,
                  eps: float = 1e-8):
+        """
+        Initialise RMSNorm with a learnable gain vector.
+
+        Args:
+            feature_size (int): Number of features to normalise (last
+                dimension).
+            device (torch.device): Device on which the gain parameter is
+                created.
+            eps (float): Small constant added to the RMS for numerical
+                stability.
+        """
         super().__init__()
         self.feature_size = feature_size
         self.device = device
@@ -124,13 +235,31 @@ class RMSNorm(nn.Module):
         self.gain = nn.Parameter(torch.ones((feature_size,),
                                             device=device))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RMS normalisation followed by element-wise gain scaling.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape
+                (..., feature_size).
+
+        Returns:
+            torch.Tensor: Normalised and scaled tensor, same shape as input.
+        """
         rec_rms = torch.rsqrt(torch.mean(x.square(), -1, keepdim=True) + self.eps)
         normalized = x * rec_rms * self.gain
 
         return normalized
 
 class GroupedQueryAttention(nn.Module):
+    """
+    Multi-head causal self-attention with Grouped Query Attention (GQA).
+
+    Query heads are split into groups that share a single key/value head,
+    reducing KV-cache memory without significantly degrading quality.
+    Rotary Position Embeddings (RoPE) are applied to queries and keys.
+    """
+
     def __init__(self,
                  layer_idx: int,
                  embedding_dim: int,
@@ -140,7 +269,17 @@ class GroupedQueryAttention(nn.Module):
                  head_size: int,
                  device: torch.device):
         """
-        Implementation of Grouped-Query Attention
+        Initialise a single GQA attention layer.
+
+        Args:
+            layer_idx (int): Index of this layer within the decoder stack,
+                used as the KV-cache key.
+            embedding_dim (int): Residual stream dimension D.
+            sequence_length (int): Maximum context length.
+            n_heads (int): Number of query heads.
+            n_kv_heads (int): Number of key/value heads (must divide n_heads).
+            head_size (int): Dimension per attention head (D // n_heads).
+            device (torch.device): Device for parameter initialisation.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -159,7 +298,22 @@ class GroupedQueryAttention(nn.Module):
                    x: torch.Tensor,
                    rope_cos: torch.Tensor,
                    rope_sin: torch.Tensor,
-                   offset: int):
+                   offset: int) -> torch.Tensor:
+        """
+        Apply Rotary Position Embeddings to a query or key tensor.
+
+        Args:
+            x (torch.Tensor): Tensor of shape (B, G, H//G, T, head_size) to
+                rotate.
+            rope_cos (torch.Tensor): Cosine component of shape
+                (1, 1, 1, seq_len, head_size).
+            rope_sin (torch.Tensor): Sine component of shape
+                (1, 1, 1, seq_len, head_size).
+            offset (int): Position offset for cached keys during inference.
+
+        Returns:
+            torch.Tensor: Rotated tensor, same shape as x.
+        """
         rope_slice = slice(offset, offset + x.shape[-2])
         inv_x2 = x[..., ::2]     # (B, G, H // G, T or 1, HS)
         inv_x1 = -x[..., 1::2]
@@ -172,8 +326,23 @@ class GroupedQueryAttention(nn.Module):
                 mask: torch.Tensor,
                 kv_cache: Union[dict[int, tuple[torch.Tensor, torch.Tensor]], None],
                 rope_cos: torch.Tensor,
-                rope_sin: torch.Tensor):
+                rope_sin: torch.Tensor) -> torch.Tensor:
+        """
+        Compute grouped-query causal self-attention for a batch of sequences.
 
+        Args:
+            embeddings (torch.Tensor): Input residual of shape (B, T, D).
+            mask (torch.Tensor): Additive causal mask of shape (1, 1, 1, T, T)
+                where -inf entries block future positions.
+            kv_cache (dict[int, tuple[torch.Tensor, torch.Tensor]] | None):
+                Optional KV-cache mapping layer index to (K, V) tensors.
+                Updated in-place during inference.
+            rope_cos (torch.Tensor): Cosine RoPE component.
+            rope_sin (torch.Tensor): Sine RoPE component.
+
+        Returns:
+            torch.Tensor: Attention output of shape (B, T, D).
+        """
         B, T, _ = embeddings.shape
         H = self.n_heads
         G = self.n_kv_heads
@@ -216,9 +385,24 @@ class GroupedQueryAttention(nn.Module):
         return y
     
 class SwiGLU(nn.Module):
+    """
+    SwiGLU feed-forward block: FFN with a gated activation.
+
+    Uses a single fused linear projection for the gate and up-projection to
+    halve memory-access overhead, then applies SiLU gating before the
+    down-projection.
+    """
+
     def __init__(self,
                  input_embedding_dim: int,
                  hidden_embedding_dim: int):
+        """
+        Initialise SwiGLU with fused gate/up projection and down projection.
+
+        Args:
+            input_embedding_dim (int): Input (and output) dimension D.
+            hidden_embedding_dim (int): Hidden dimension H of the FFN.
+        """
         super().__init__()
         self.linear_12 = nn.Linear(input_embedding_dim,
                              2 * hidden_embedding_dim, bias=False)
@@ -226,6 +410,15 @@ class SwiGLU(nn.Module):
                                     input_embedding_dim, bias=False)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply SwiGLU transformation.
+
+        Args:
+            x (torch.Tensor): Input of shape (B, T, D).
+
+        Returns:
+            torch.Tensor: Output of shape (B, T, D).
+        """
         # x -> (B, T, D)
         # A more efficient way of implementing the SwiGLU:
         # instead of accessing twice the memory we just have
@@ -240,6 +433,13 @@ class SwiGLU(nn.Module):
 
     
 class TransformerDecoder(nn.Module):
+    """
+    Stacked causal transformer decoder with GQA, SwiGLU FFN, and RMSNorm.
+
+    Manages the causal mask, RoPE sin/cos buffers, and the stacked attention
+    and FFN blocks. Supports a KV-cache for efficient autoregressive decoding.
+    """
+
     casual_mask: torch.Tensor
     rope_freqs: torch.Tensor
     rope_cos: torch.Tensor
@@ -255,6 +455,24 @@ class TransformerDecoder(nn.Module):
                  kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
                  device: torch.device):
+        """
+        Initialise the transformer decoder stack.
+
+        Args:
+            n_blocks (int): Number of decoder blocks.
+            sequence_length (int): Maximum context length in tokens.
+            embedding_dim (int): Residual stream dimension D.
+            n_heads (int): Number of query attention heads.
+            n_kv_heads (int): Number of key/value heads.
+            ffn_hidden_dim (int | None): SwiGLU hidden dimension; defaults to
+                4 × embedding_dim when None.
+            kv_cache (dict[int, tuple[torch.Tensor, torch.Tensor]]): Shared
+                KV-cache dict updated in-place during inference. Pass an empty
+                dict for training.
+            dropout_rate (float): Dropout probability applied after attention
+                and FFN outputs.
+            device (torch.device): Device for all buffers and parameters.
+        """
         super().__init__()
         mask_shape = (1, 1, 1, sequence_length, sequence_length)
         self.register_buffer("casual_mask",
@@ -309,7 +527,18 @@ class TransformerDecoder(nn.Module):
     def build_rope_sin_cos(self,
                            dtype: torch.dtype,
                            use_gqa: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pre-compute RoPE cosine and sine tables for all positions.
 
+        Args:
+            dtype (torch.dtype): Floating-point dtype for the tables.
+            use_gqa (bool): If True, adds GQA-specific batch dimensions
+                (B, G, H, T, HS); otherwise uses (B, H, T, HS).
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: ``(cos, sin)`` tables with
+                shape determined by ``use_gqa``.
+        """
         assert self.head_size % 2 == 0
 
         # i goes from 0 to head_dim - 2
@@ -338,6 +567,16 @@ class TransformerDecoder(nn.Module):
     def extend_rope_sin_cos(self,
                             extend_token_pos: int,
                             use_gqa: bool = True) -> None:
+        """
+        Append one new position to the RoPE tables for autoregressive decoding.
+
+        Called during inference when the generated sequence exceeds the
+        pre-computed context length.
+
+        Args:
+            extend_token_pos (int): Absolute position index of the new token.
+            use_gqa (bool): Must match the value used in build_rope_sin_cos.
+        """
         # During inference, if we are generating one token at time, in an
         # autoregressive mode, we need to compute new RoPE sin and cos.
         # (HS / 2)
@@ -358,7 +597,16 @@ class TransformerDecoder(nn.Module):
         self.rope_sin = torch.cat([self.rope_sin, sin], dim=-2)  # (B, G, H, T + 1, HS)
         
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run all decoder blocks on an embedded sequence.
+
+        Args:
+            x (torch.Tensor): Embedded token sequence of shape (B, T, D).
+
+        Returns:
+            torch.Tensor: Output sequence of shape (B, T, D).
+        """
         # x -> (B, T, D)
         _, T, _ = x.shape
         mask = self.casual_mask[:, :, :, :T, :T]
@@ -390,6 +638,10 @@ class TransformerDecoder(nn.Module):
         return x # (B, T, D)
     
 class LanguageModel(nn.Module):
+    """
+    Decoder-only causal language model with tied input/output embeddings.
+    """
+
     def __init__(self,
                  n_decoder_blocks: int,
                  sequence_length: int,
@@ -401,6 +653,22 @@ class LanguageModel(nn.Module):
                  kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
                  device: torch.device):
+        """
+        Initialise the language model.
+
+        Args:
+            n_decoder_blocks (int): Number of decoder blocks.
+            sequence_length (int): Maximum context length.
+            vocab_size (int): Vocabulary size.
+            embedding_dim (int): Residual stream dimension D.
+            n_heads (int): Number of query attention heads.
+            n_kv_heads (int): Number of key/value heads.
+            ffn_hidden_dim (int | None): SwiGLU hidden dimension.
+            kv_cache (dict[int, tuple[torch.Tensor, torch.Tensor]]): KV-cache
+                dict shared with the decoder.
+            dropout_rate (float): Dropout probability.
+            device (torch.device): Device for all parameters and buffers.
+        """
         super().__init__()
         self.device = device
         self.vocab_size = vocab_size
@@ -426,6 +694,15 @@ class LanguageModel(nn.Module):
         )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute next-token logits for a batch of token sequences.
+
+        Args:
+            x (torch.Tensor): Integer token IDs of shape (B, T).
+
+        Returns:
+            torch.Tensor: Logits of shape (B, T, vocab_size).
+        """
         tokens = x                                 # (B, T)
         embeddings = self.embedding_matrix(tokens) # (B, T, D)
         out = self.transformer_decoder(embeddings) # (B, T, D)
@@ -442,6 +719,18 @@ class LanguageModel(nn.Module):
                     config: ModelConfig,
                     kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                     device: torch.device) -> "LanguageModel":
+        """
+        Construct a LanguageModel from a ModelConfig.
+
+        Args:
+            config (ModelConfig): Model architecture configuration.
+            kv_cache (dict[int, tuple[torch.Tensor, torch.Tensor]]): KV-cache
+                dict to pass through to the decoder.
+            device (torch.device): Target device.
+
+        Returns:
+            LanguageModel: Fully initialised language model.
+        """
         return cls(
             n_decoder_blocks=config.n_decoder_blocks,
             sequence_length=config.sequence_length,
@@ -455,58 +744,3 @@ class LanguageModel(nn.Module):
             device=device,
         )
 
-if __name__ == "__main__":
-    batch_size = 1
-    config = ModelConfig.from_yaml(Path(__file__).resolve().parents[1] / "configs" / "model.yaml")
-    kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    supported_dtype = get_supported_weights_precision(device)
-    use_amp = device.type == "cuda"
-    use_grad_scaler = use_amp and supported_dtype == torch.float16
-
-    language_model: nn.Module = LanguageModel.from_config(config, kv_cache=kv_cache, device=device).to(device)
-    optimizer = torch.optim.AdamW(language_model.parameters(), lr=3e-4)
-
-    # Python 3.14 is supported by torch.compile starting from PyTorch 2.10.
-    # Keep compilation opt-in here because the first compile can dominate a tiny
-    # local smoke run; enable it for real training benchmarks.
-    use_compile = False
-    language_model = compile_language_model(language_model, enabled=use_compile)
-    
-    batch_of_tokens: list[list[int]] = []
-    for _ in range(batch_size):
-        sequence: list[int] = []
-        for _ in range(config.sequence_length + 1):
-            sequence.append(random.randint(0, config.vocab_size - 1))
-
-        batch_of_tokens.append(sequence)
-
-
-    new_token = torch.tensor([[random.randint(0, config.vocab_size - 1)]], dtype=torch.long) # (B=1, T=1)
-    new_token_target = torch.tensor([[random.randint(0, config.vocab_size - 1)]], dtype=torch.long)
-        
-
-    inputs = torch.tensor([sequence[:-1] for sequence in batch_of_tokens], dtype=torch.long) # (B, T)
-    targets = torch.tensor([sequence[1:] for sequence in batch_of_tokens], dtype=torch.long)
-
-    dataloader: list[tuple[torch.Tensor, torch.Tensor]] = [
-        (inputs, targets),
-        (new_token, new_token_target)
-    ]
-
-    scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
-
-
-    for inputs, targets in dataloader:
-        loss = training_step(
-            language_model=language_model,
-            optimizer=optimizer,
-            scaler=scaler,
-            inputs=inputs,
-            targets=targets,
-            device=device,
-            amp_dtype=supported_dtype,
-            use_amp=use_amp,
-            max_grad_norm=1.0
-        )
-        print(f"Training loss: {loss:.4f}")

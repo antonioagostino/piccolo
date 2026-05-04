@@ -53,18 +53,49 @@ class TrainingConfig:
 
 
 class MetricsLogger:
+    """
+    No-op metrics logger used as a default when W&B is disabled.
+    """
+
     def log(self, metrics: dict[str, float | int], step: int) -> None:
+        """
+        Record a dictionary of metrics at a given training step.
+
+        Args:
+            metrics (dict[str, float | int]): Mapping of metric names to
+                values.
+            step (int): Global step index (e.g. tokens seen).
+        """
         pass
 
     def finish(self) -> None:
+        """
+        Finalise the logging session and flush any pending data."""
         pass
 
 
 class WandbMetricsLogger(MetricsLogger):
+    """
+    Metrics logger that streams training metrics to Weights & Biases.
+    """
+
     def __init__(self,
                  config: WandbConfig,
                  training_config: TrainingConfig,
                  model_config: ModelConfig) -> None:
+        """
+        Initialise and start a W&B run.
+
+        Args:
+            config (WandbConfig): W&B project, run name, and mode settings.
+            training_config (TrainingConfig): Full training configuration
+                logged as run metadata.
+            model_config (ModelConfig): Model architecture configuration
+                logged as run metadata.
+
+        Raises:
+            RuntimeError: If the ``wandb`` package is not installed.
+        """
         try:
             wandb = import_module("wandb")
         except ImportError as exc:
@@ -85,14 +116,33 @@ class WandbMetricsLogger(MetricsLogger):
         )
 
     def log(self, metrics: dict[str, float | int], step: int) -> None:
+        """
+        Log a dictionary of metrics to the active W&B run.
+
+        Args:
+            metrics (dict[str, float | int]): Mapping of metric names to
+                values.
+            step (int): Global step index used as the x-axis in W&B charts.
+        """
         self.__wandb.log(metrics, step=step)
 
     def finish(self) -> None:
+        """
+        Finalise the W&B run, uploading any remaining queued data."""
         if self.__run is not None:
             self.__run.finish()
 
 
 def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
+    """
+    Serialise a TrainingConfig to a plain dict suitable for JSON / W&B logging.
+
+    Args:
+        config (TrainingConfig): The training configuration to serialise.
+
+    Returns:
+        dict[str, Any]: Flat dictionary representation of the config.
+    """
     return {
         "data_dir": str(config.data_dir),
         "model_config": str(config.model_config),
@@ -119,12 +169,37 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
 
 
 def as_mapping(value: Any, name: str) -> dict[str, Any]:
+    """
+    Assert that a YAML-parsed value is a dict and return it.
+
+    Args:
+        value (Any): The value to check.
+        name (str): Human-readable name of the value, used in the error
+            message.
+
+    Returns:
+        dict[str, Any]: The value cast to a dict.
+
+    Raises:
+        ValueError: If value is not a dict.
+    """
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a YAML mapping")
     return value
 
 
 def load_training_config(config_path: Path) -> TrainingConfig:
+    """
+    Parse and return a TrainingConfig from a YAML file.
+
+    Missing keys fall back to their documented defaults.
+
+    Args:
+        config_path (Path): Path to the YAML training configuration file.
+
+    Returns:
+        TrainingConfig: The parsed training configuration.
+    """
     with config_path.open("r", encoding="utf-8") as config_file:
         raw_config = yaml.safe_load(config_file)
 
@@ -162,6 +237,15 @@ def load_training_config(config_path: Path) -> TrainingConfig:
 
 
 def validate_config(config: TrainingConfig) -> None:
+    """
+    Raise if any field in the training config violates its constraint.
+
+    Args:
+        config (TrainingConfig): The configuration to validate.
+
+    Raises:
+        ValueError: If any field is out of range or logically inconsistent.
+    """
     if not 0.0 < config.train_split_size <= 1.0:
         raise ValueError("train_split_size must be in the interval (0, 1]")
     if config.batch_size <= 0:
@@ -187,12 +271,34 @@ def validate_config(config: TrainingConfig) -> None:
 
 
 def resolve_data_dir(data_dir: Path) -> Path:
+    """
+    Resolve the effective data directory, descending into ``raw_text`` if present.
+
+    Args:
+        data_dir (Path): Base data directory from the training config.
+
+    Returns:
+        Path: The resolved directory containing dataset sub-folders.
+    """
     if (data_dir / "raw_text").is_dir():
         return data_dir / "raw_text"
     return data_dir
 
 
 def resolve_device(requested_device: str) -> torch.device:
+    """
+    Resolve a device string to a torch.device.
+
+    Args:
+        requested_device (str): Device string from the training config.
+            Pass ``"auto"`` to automatically select CUDA when available.
+
+    Returns:
+        torch.device: The resolved compute device.
+
+    Raises:
+        ValueError: If ``"cuda"`` is requested but CUDA is not available.
+    """
     if requested_device == "auto":
         return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -204,6 +310,12 @@ def resolve_device(requested_device: str) -> torch.device:
 
 
 def seed_everything(seed: int) -> None:
+    """
+    Set all relevant random seeds for reproducible training.
+
+    Args:
+        seed (int): The integer seed applied to Python, PyTorch, and CUDA RNGs.
+    """
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -211,6 +323,24 @@ def seed_everything(seed: int) -> None:
 
 
 def get_learning_rate(config: TrainingConfig, iteration: int) -> float:
+    """
+    Compute the learning rate for a given training iteration.
+
+    Applies linear warm-up from 0 to ``learning_rate`` over
+    ``lr_warmup_iterations`` steps, then cosine decay to
+    ``min_learning_rate`` over the remaining iterations.
+
+    Args:
+        config (TrainingConfig): Training configuration holding the LR
+            schedule parameters.
+        iteration (int): Current training step (1-indexed).
+
+    Returns:
+        float: The learning rate to use at this iteration.
+
+    Raises:
+        ValueError: If iteration is not positive.
+    """
     if iteration <= 0:
         raise ValueError("iteration must be greater than 0")
 
@@ -230,17 +360,48 @@ def get_learning_rate(config: TrainingConfig, iteration: int) -> float:
 
 
 def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    """
+    Update the learning rate in all optimizer parameter groups.
+
+    Args:
+        optimizer (torch.optim.Optimizer): The optimizer to update.
+        learning_rate (float): New learning rate value.
+    """
     for parameter_group in optimizer.param_groups:
         parameter_group["lr"] = learning_rate
 
 
 def build_logger(config: TrainingConfig, model_config: ModelConfig) -> MetricsLogger:
+    """
+    Construct the appropriate metrics logger based on the training config.
+
+    Args:
+        config (TrainingConfig): Training configuration; inspects
+            ``config.wandb.enabled`` to choose the logger type.
+        model_config (ModelConfig): Model configuration passed to the W&B
+            logger for metadata logging.
+
+    Returns:
+        MetricsLogger: A WandbMetricsLogger if W&B is enabled, otherwise the
+            no-op MetricsLogger.
+    """
     if config.wandb.enabled:
         return WandbMetricsLogger(config.wandb, config, model_config)
     return MetricsLogger()
 
 
 def reset_inference_state(language_model: torch.nn.Module) -> None:
+    """
+    Reset the KV-cache and token counter on the transformer decoder.
+
+    Called between validation sequences to prevent context bleed across
+    independent sequences during inference. Handles compiled models
+    (``_orig_mod``) transparently.
+
+    Args:
+        language_model (torch.nn.Module): The language model whose internal
+            decoder state should be reset.
+    """
     model = getattr(language_model, "_orig_mod", language_model)
     transformer_decoder = getattr(model, "transformer_decoder", None)
     if transformer_decoder is None:
@@ -257,6 +418,22 @@ def validate(
     amp_dtype: torch.dtype,
     use_amp: bool,
 ) -> float | None:
+    """
+    Run one full validation pass and return the mean per-token loss.
+
+    Args:
+        language_model (torch.nn.Module): The model to evaluate (set to eval
+            mode internally).
+        pre_training_dataset (PreTrainingDataset): Dataset whose validation
+            split is consumed sequentially.
+        device (torch.device): Device that tensors are moved to.
+        amp_dtype (torch.dtype): dtype used inside the autocast region.
+        use_amp (bool): Whether to enable automatic mixed precision.
+
+    Returns:
+        float | None: Mean per-token cross-entropy loss over the validation
+            split, or None if no validation batches were produced.
+    """
     language_model.eval()
     total_token_loss = 0.0
     total_tokens = 0
@@ -291,6 +468,19 @@ def validate(
 
 
 def train(config: TrainingConfig) -> None:
+    """Run the full pre-training loop from a TrainingConfig.
+
+    Validates the config, initialises the model, optimizer, and dataset,
+    then iterates over sequential batches. Logs metrics periodically and
+    runs a full validation pass at the end.
+
+    Args:
+        config (TrainingConfig): Complete training configuration.
+
+    Raises:
+        ValueError: If config validation fails or the data directory is
+            missing.
+    """
     validate_config(config)
     seed_everything(config.seed)
 
@@ -419,6 +609,13 @@ def train(config: TrainingConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments for the training entry point.
+
+    Returns:
+        argparse.Namespace: Parsed arguments with a ``config`` field holding
+            the path to the YAML training configuration.
+    """
     parser = argparse.ArgumentParser(description="Train the friendsbot language model.")
     parser.add_argument(
         "--config",

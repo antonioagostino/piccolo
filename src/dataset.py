@@ -17,10 +17,14 @@ class SplitTokenCounts:
 def load_text_from_parquet_file(dataset_file_path: Union[str, Path],
                                 raw_texts_column_name: str) -> list[str]:
     """
-    A utility function for loading raw texts from a Parquet file.
+    Load raw texts from a single Parquet file.
+
     Args:
-        dataset_file_path: the Parquet file's path.
-        raw_texts_column_name: the file's column containing the raw texts.
+        dataset_file_path (str | Path): Path to the Parquet file.
+        raw_texts_column_name (str): Name of the column containing raw text.
+
+    Returns:
+        list[str]: List of raw text strings from the specified column.
     """
     return pd.read_parquet(dataset_file_path)[raw_texts_column_name].to_list()
 
@@ -38,6 +42,22 @@ PRE_TRAINING_DATASETS_ARGS = {
 
 def get_pre_training_dataset_files(data_path: Union[str, Path],
                                    rng: Any) -> Generator[Path, None, None]:
+    """
+    Yield pre-training data files from all dataset sub-directories.
+
+    Iterates over immediate sub-directories of data_path, shuffles both
+    directory and file order to avoid positional bias, then yields each
+    file path one by one.
+
+    Args:
+        data_path (str | Path): Root directory containing one sub-directory
+            per dataset (e.g. ``CulturaX/``).
+        rng (Any): A random object with a ``shuffle`` method (e.g.
+            ``random.Random``).
+
+    Yields:
+        Path: Path to each data file found under the sub-directories.
+    """
     pre_training_datasets_dirs = [ds_dir for ds_dir in Path(data_path).iterdir() if ds_dir.is_dir()]
 
     # Shuffle to avoid bias coming from files and dirs ordering
@@ -52,6 +72,17 @@ def get_pre_training_dataset_files(data_path: Union[str, Path],
 
 
 def validate_pre_training_file(file: Path) -> None:
+    """
+    Validate that a data file has the expected extension for its dataset.
+
+    Args:
+        file (Path): Path to the file to validate. The parent directory name
+            is used to look up the expected extension.
+
+    Raises:
+        ValueError: If the file extension does not match the expected
+            extension for the dataset type.
+    """
     dataset_name = file.parent.stem
     expected_extension = PRE_TRAINING_DATASETS_EXTENSIONS[dataset_name]
     if file.suffix != expected_extension:
@@ -60,6 +91,18 @@ def validate_pre_training_file(file: Path) -> None:
 
 
 def load_pre_training_raw_texts(file: Path) -> list[str]:
+    """
+    Load raw texts from a pre-training data file using the mapped loader.
+
+    Dispatches to the appropriate loading function based on the parent
+    directory name of the file.
+
+    Args:
+        file (Path): Path to a validated pre-training data file.
+
+    Returns:
+        list[str]: Raw text strings extracted from the file.
+    """
     dataset_name = file.parent.stem
     return PRE_TRAINING_DATASETS_FN[dataset_name](
         file,
@@ -71,6 +114,25 @@ def count_pre_training_tokens(data_path: Union[str, Path],
                               train_split_size: float,
                               tokenizer: Tokenizer,
                               random_seed: int | None = None) -> SplitTokenCounts:
+    """
+    Count total train and validation tokens across all pre-training files.
+
+    Tokenizes every text in every file under data_path, applies the
+    train/validation split, and sums the resulting token counts (including
+    one end-of-sequence token per text).
+
+    Args:
+        data_path (str | Path): Root data directory (passed to
+            get_pre_training_dataset_files).
+        train_split_size (float): Fraction of texts to assign to the train
+            split; must be in (0, 1].
+        tokenizer (Tokenizer): Tokenizer used to encode each text.
+        random_seed (int | None): Seed for the internal RNG that controls
+            file and text ordering. Pass None for a non-deterministic order.
+
+    Returns:
+        SplitTokenCounts: Dataclass with train_tokens and val_tokens fields.
+    """
     assert Path(data_path).exists() and Path(data_path).is_dir(), \
         f"{data_path} is not a valid directory"
     assert train_split_size > 0 and train_split_size <= 1, \
@@ -99,6 +161,15 @@ def count_pre_training_tokens(data_path: Union[str, Path],
     
                     
 class PreTrainingDataset:
+    """
+    Streaming pre-training dataset with train/validation splitting.
+
+    Reads data files lazily, tokenizes them, and maintains separate token
+    buffers for the train and validation splits. Supports both overlapping
+    (get_batch) and non-overlapping sequential (get_sequential_batch) access
+    patterns.
+    """
+
     def __init__(self,
                  data_path: str,
                  sequence_length: int,
@@ -108,20 +179,17 @@ class PreTrainingDataset:
                  device: torch.device,
                  random_seed: int | None = None) -> None:
         """
-        A simple class for managing a pre-training dataset for LLMs pre-training.
-        Given a data_path, it iterates through its children
-        directories and checks datasets' files matching the mapped format and
-        directory names.
+        Initialise the pre-training dataset.
+
         Args:
-            data_path (str): the directory containing all the datasets the user
-                wants to use for LLMs pre-training, as subfolders.
-            sequence_length (int): the desired length of each sequence sampled from the
-                pre-training dataset.
-            train_split_size (float): a float between 0 and 1. The remaining will be used
-                for the validation split.
-            batch_size (int): number of sequences contained in each batch.
-            tokenizer (Tokenizer): tokenizer used to tokenize raw text sequences.
-            device (torch.device): select between 'cpu', 'cuda', 'mps', and so on.
+            data_path (str): Root directory containing dataset sub-directories.
+            sequence_length (int): Length of each token sequence in a batch.
+            train_split_size (float): Fraction of texts used for training;
+                the remainder forms the validation split.
+            batch_size (int): Number of sequences per batch.
+            tokenizer (Tokenizer): Tokenizer used to encode raw text.
+            device (torch.device): Device on which batch tensors are created.
+            random_seed (int | None): Optional RNG seed for reproducibility.
         """
         assert Path(data_path).exists() and Path(data_path).is_dir(), \
             f"{data_path} is not a valid directory"
@@ -145,14 +213,15 @@ class PreTrainingDataset:
 
     def __get_tokenized_splits(self) -> Generator[tuple[list[int], list[int]], None, None]:
         """
-        A generator function that iterates through the sub-directories 
-        of the given main directory. For every subdir and files inside the
-        subdirs, it checks the files' extension and the utility function
-        for managing these files, passing the mapped parameters. For
-        extending the LLMs pre-training dataset, update the 
-        pre_training_datasets_extensions, pre_training_datasets_fn, and
-        pre_training_datasets_args dictionaries.
-        The function yields the tokenized train and val corpora.
+        Yield tokenized train and validation corpora file by file.
+
+        For each file under data_path, loads and tokenizes all texts, applies
+        the train/validation split, concatenates the token sequences (appending
+        an EOS token after each text), and yields the two flat token lists.
+
+        Yields:
+            tuple[list[int], list[int]]: A ``(train_tokens, val_tokens)`` pair
+                of flat token ID lists for one data file.
         """
         for file in get_pre_training_dataset_files(self.data_path, self.__rng):
             validate_pre_training_file(file)
@@ -188,11 +257,15 @@ class PreTrainingDataset:
                             buffer_type: str,
                             required_tokens: int | None = None) -> bool:
         """
-        A simple utility function for checking if the train or validation token buffers
-        are great enough to contruct a batch of token sequences for the next training 
-        iteration.
+        Check whether the token buffer for a split holds enough tokens for a batch.
+
         Args:
-            buffer_type (str): 'train' or 'val' split.
+            buffer_type (str): Either ``"train"`` or ``"val"``.
+            required_tokens (int | None): Minimum token count required. Defaults
+                to batch_size + sequence_length when None.
+
+        Returns:
+            bool: True if the buffer contains at least required_tokens tokens.
         """
         assert buffer_type in ["train", "val"], f"Buffer type must be equal to 'train' or 'val'"
         if required_tokens is None:
@@ -202,6 +275,18 @@ class PreTrainingDataset:
     def __fill_tokens_buffer(self,
                              split: str,
                              required_tokens: int | None = None) -> None:
+        """
+        Fill a split's token buffer until it is large enough for a batch.
+
+        Repeatedly draws from the tokenized-splits generator until the buffer
+        reaches the required size or the data is exhausted. Sets
+        training_data_finished to True when the generator is empty.
+
+        Args:
+            split (str): Either ``"train"`` or ``"val"``.
+            required_tokens (int | None): Token count target. Forwarded to
+                __check_buffer_size.
+        """
         while not self.__check_buffer_size(split, required_tokens):
             try:
                 train_buffer, val_buffer = next(self.__tokens_generator)
@@ -215,12 +300,22 @@ class PreTrainingDataset:
     def get_batch(self,
                   split: str) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        A fuction that prepares the batch of token sequences pulling them from the
-        training or validation token buffers
+        Sample a batch of overlapping sequences from the token buffer.
+
+        Each call advances the buffer by one token per sequence (sliding-window
+        style), so tokens are reused across calls.
+
         Args:
-            split (str): 'train' or 'val' split.
-        Return:
-            Tuple[torch.Tensor, torch.Tensor]: the sequence and the shifted sequence.
+            split (str): Either ``"train"`` or ``"val"``.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: ``(inputs, targets)`` tensors of
+                shape (batch_size, sequence_length), where targets is inputs
+                shifted right by one position.
+
+        Raises:
+            StopIteration: When the data is exhausted and the buffer is too
+                small to form a complete batch.
         """
         assert split in ["train", "val"], f"Split must be equal to 'train' or 'val'"
         self.__fill_tokens_buffer(split)
@@ -241,9 +336,22 @@ class PreTrainingDataset:
     def get_sequential_batch(self,
                              split: str) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Prepares a non-overlapping next-token batch for language model training.
-        Each returned sequence advances the split buffer by sequence_length tokens,
-        so every token is used as an input at most once in one dataset pass.
+        Sample a non-overlapping batch from the token buffer.
+
+        Each call advances the buffer by sequence_length tokens per sequence,
+        so every token is used as an input at most once per dataset pass.
+
+        Args:
+            split (str): Either ``"train"`` or ``"val"``.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: ``(inputs, targets)`` tensors of
+                shape (batch_size, sequence_length), where targets is inputs
+                shifted right by one position.
+
+        Raises:
+            StopIteration: When the data is exhausted and the buffer is too
+                small to form a complete batch.
         """
         assert split in ["train", "val"], f"Split must be equal to 'train' or 'val'"
         required_tokens = self.batch_size * self.sequence_length + 1
@@ -261,32 +369,3 @@ class PreTrainingDataset:
 
         return torch.stack(x), torch.stack(y)
 
-
-if __name__ == "__main__":
-    pre_training_data_path = "./data/raw_text/"
-    tokenizer = TiktokenTokenizer()
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    pre_training_dataset = PreTrainingDataset(pre_training_data_path,
-                                              8,
-                                              0.9,
-                                              4,
-                                              tokenizer,
-                                              device
-                                              )
-    while True:
-        try:
-            x, y = pre_training_dataset.get_batch("train")
-            print(x)
-            print(y)
-        except StopIteration:
-            print("Training dataset finished!")
-            break
-
-    while True:
-        try:
-            x, y = pre_training_dataset.get_batch("val")
-            print(x)
-            print(y)
-        except StopIteration:
-            print("Validation dataset finished!")
-            break
