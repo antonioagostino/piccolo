@@ -488,7 +488,11 @@ def validate(
     total_tokens = 0
 
     with torch.no_grad():
-        progress = tqdm(desc="Validation", unit="Token")
+        progress = tqdm(
+            desc="\033[1mValidation\033[0m",
+            unit=" total tokens",
+            bar_format="{desc}: {n_fmt}{unit} [elapsed: {elapsed}, {rate_fmt}{postfix}]",
+        )
         while True:
             try:
                 inputs, targets = pre_training_dataset.get_sequential_batch("val")
@@ -603,7 +607,11 @@ def train(config: TrainingConfig) -> None:
             device,
             random_seed=config.seed,
         )
-        progress = tqdm(desc="Training", unit="Token")
+        progress = tqdm(
+            desc="\033[1mTraining\033[0m",
+            unit=" total tokens",
+            bar_format="{desc}: {n_fmt}{unit} [elapsed: {elapsed}, {rate_fmt}{postfix}]",
+        )
 
         while True:
             try:
