@@ -1,1 +1,1 @@
-# Friendbots
+# Friendsbot
