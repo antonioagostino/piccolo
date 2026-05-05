@@ -235,7 +235,7 @@ def load_training_config(config_path: Path) -> TrainingConfig:
         checkpoint_dir=Path(training.get("checkpoint_dir", "./checkpoints")),
         wandb=WandbConfig(
             enabled=bool(wandb_config.get("enabled", True)),
-            project=str(wandb_config.get("project", "friendbots")),
+            project=str(wandb_config.get("project", "friendsbot")),
             run_name=wandb_config.get("run_name"),
             mode=str(wandb_config.get("mode", "online")),
         ),

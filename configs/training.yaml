@@ -18,6 +18,6 @@ training:
   checkpoint_dir: ./checkpoints
   wandb:
     enabled: true
-    project: friendbots
+    project: friendsbot
     run_name: null
     mode: online
