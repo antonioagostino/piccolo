@@ -12,6 +12,7 @@ training:
   max_grad_norm: 1.0
   device: auto
   compile_model: false
+  gradient_checkpointing: false
   seed: 42
   log_every_tokens: 2048
   val_every_iterations: 500

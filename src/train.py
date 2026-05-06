@@ -47,6 +47,7 @@ class TrainingConfig:
     max_grad_norm: float | None
     device: str
     compile_model: bool
+    gradient_checkpointing: bool
     seed: int
     log_every_tokens: int
     val_every_iterations: int
@@ -159,6 +160,7 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "max_grad_norm": config.max_grad_norm,
         "device": config.device,
         "compile_model": config.compile_model,
+        "gradient_checkpointing": config.gradient_checkpointing,
         "seed": config.seed,
         "log_every_tokens": config.log_every_tokens,
         "val_every_iterations": config.val_every_iterations,
@@ -229,6 +231,7 @@ def load_training_config(config_path: Path) -> TrainingConfig:
         max_grad_norm=training.get("max_grad_norm", 1.0),
         device=str(training.get("device", "auto")),
         compile_model=bool(training.get("compile_model", False)),
+        gradient_checkpointing=bool(training.get("gradient_checkpointing", False)),
         seed=int(training.get("seed", 42)),
         log_every_tokens=int(training.get("log_every_tokens", 2048)),
         val_every_iterations=int(training.get("val_every_iterations", 500)),
@@ -566,6 +569,7 @@ def train(config: TrainingConfig) -> None:
         model_config,
         kv_cache={},
         device=device,
+        gradient_checkpointing=config.gradient_checkpointing,
     ).to(device)
     language_model = compile_language_model(language_model, enabled=config.compile_model)
 

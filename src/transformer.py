@@ -5,6 +5,7 @@ import random
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 import yaml
 
 
@@ -323,7 +324,7 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self,
                 embeddings: torch.Tensor,
-                mask: torch.Tensor,
+                is_causal: bool,
                 kv_cache: Union[dict[int, tuple[torch.Tensor, torch.Tensor]], None],
                 rope_cos: torch.Tensor,
                 rope_sin: torch.Tensor) -> torch.Tensor:
@@ -332,8 +333,9 @@ class GroupedQueryAttention(nn.Module):
 
         Args:
             embeddings (torch.Tensor): Input residual of shape (B, T, D).
-            mask (torch.Tensor): Additive causal mask of shape (1, 1, 1, T, T)
-                where -inf entries block future positions.
+            is_causal (bool): Whether to apply a causal mask inside
+                scaled_dot_product_attention. True during training and prefill;
+                False for single-token autoregressive generation with KV-cache.
             kv_cache (dict[int, tuple[torch.Tensor, torch.Tensor]] | None):
                 Optional KV-cache mapping layer index to (K, V) tensors.
                 Updated in-place during inference.
@@ -369,16 +371,7 @@ class GroupedQueryAttention(nn.Module):
 
             kv_cache[self.layer_idx] = (k, v)
 
-        # INEFFICIENT CAUSAL ATTENTION
-        # ==================================
-        # logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_size)
-        # if mask is not None:
-        #    logits = logits + mask
-            
-        # weights = F.softmax(logits, dim=-1)
-        # outputs = torch.matmul(weights, v)
-        # ==================================
-        outputs = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=True)
+        outputs = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, enable_gqa=True)
         outputs = outputs.permute(0, 3, 1, 2, 4).contiguous().view(B, T, self.embedding_dim)
         y = self.output_proj(outputs)
 
@@ -440,7 +433,6 @@ class TransformerDecoder(nn.Module):
     and FFN blocks. Supports a KV-cache for efficient autoregressive decoding.
     """
 
-    casual_mask: torch.Tensor
     rope_freqs: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
@@ -454,7 +446,8 @@ class TransformerDecoder(nn.Module):
                  ffn_hidden_dim: int | None,
                  kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
-                 device: torch.device):
+                 device: torch.device,
+                 gradient_checkpointing: bool = False):
         """
         Initialise the transformer decoder stack.
 
@@ -472,16 +465,12 @@ class TransformerDecoder(nn.Module):
             dropout_rate (float): Dropout probability applied after attention
                 and FFN outputs.
             device (torch.device): Device for all buffers and parameters.
+            gradient_checkpointing (bool): If True, trades compute for memory
+                by recomputing block activations during the backward pass.
         """
         super().__init__()
-        mask_shape = (1, 1, 1, sequence_length, sequence_length)
-        self.register_buffer("casual_mask",
-                             torch.triu(torch.full(mask_shape,
-                                                   -torch.inf,
-                                                   device=device,
-                                                   dtype=get_supported_weights_precision(device)),
-                                        diagonal=1))
         self.kv_cache = kv_cache
+        self.gradient_checkpointing = gradient_checkpointing
         self.dropout_rate = dropout_rate
         self.n_blocks = n_blocks
         self.device = device
@@ -609,33 +598,33 @@ class TransformerDecoder(nn.Module):
         """
         # x -> (B, T, D)
         _, T, _ = x.shape
-        mask = self.casual_mask[:, :, :, :T, :T]
+        # Single-token generation with KV-cache is already causal by construction.
+        is_causal = T > 1
+
         if not self.training:
             self.global_token_counter += T
-
-            # If we are in the case of autoregressive generation
             if self.global_token_counter > self.sequence_length:
-                self.extend_rope_sin_cos(self.global_token_counter - 1,
-                                         use_gqa=True)
-            if self.kv_cache:
-                total_tokens = min(self.global_token_counter, self.sequence_length)
-                mask = self.casual_mask[:, :, :, total_tokens - T:total_tokens, :total_tokens]
+                self.extend_rope_sin_cos(self.global_token_counter - 1, use_gqa=True)
 
-        for i in range(self.n_blocks):
-            attn_out = self.attentions[i](
-                self.norms_1[i](x),
-                mask,
+        def run_block(x: torch.Tensor, block_idx: int) -> torch.Tensor:
+            attn_out = self.attentions[block_idx](
+                self.norms_1[block_idx](x),
+                is_causal,
                 self.kv_cache,
                 self.rope_cos,
-                self.rope_sin
+                self.rope_sin,
             )
+            x = x + F.dropout(attn_out, self.dropout_rate, training=self.training)
+            ffn_out = self.ffns[block_idx](self.norms_2[block_idx](x))
+            return x + F.dropout(ffn_out, self.dropout_rate, training=self.training)
 
-            x = x + F.dropout(attn_out, self.dropout_rate, training=self.training) # (B, T, D)
+        for i in range(self.n_blocks):
+            if self.gradient_checkpointing and self.training:
+                x = _checkpoint(run_block, x, i, use_reentrant=False)
+            else:
+                x = run_block(x, i)
 
-            ffn_out = self.ffns[i](self.norms_2[i](x))
-            x = x + F.dropout(ffn_out, self.dropout_rate, training=self.training)
-
-        return x # (B, T, D)
+        return x  # (B, T, D)
     
 class LanguageModel(nn.Module):
     """
@@ -652,7 +641,8 @@ class LanguageModel(nn.Module):
                  ffn_hidden_dim: int | None,
                  kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
                  dropout_rate: float,
-                 device: torch.device):
+                 device: torch.device,
+                 gradient_checkpointing: bool = False):
         """
         Initialise the language model.
 
@@ -668,6 +658,8 @@ class LanguageModel(nn.Module):
                 dict shared with the decoder.
             dropout_rate (float): Dropout probability.
             device (torch.device): Device for all parameters and buffers.
+            gradient_checkpointing (bool): If True, enables gradient
+                checkpointing on the decoder blocks.
         """
         super().__init__()
         self.device = device
@@ -685,7 +677,8 @@ class LanguageModel(nn.Module):
             ffn_hidden_dim=ffn_hidden_dim,
             kv_cache=kv_cache,
             dropout_rate=dropout_rate,
-            device=device
+            device=device,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
         self.final_norm = RMSNorm(
@@ -718,7 +711,8 @@ class LanguageModel(nn.Module):
     def from_config(cls,
                     config: ModelConfig,
                     kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]],
-                    device: torch.device) -> "LanguageModel":
+                    device: torch.device,
+                    gradient_checkpointing: bool = False) -> "LanguageModel":
         """
         Construct a LanguageModel from a ModelConfig.
 
@@ -727,6 +721,8 @@ class LanguageModel(nn.Module):
             kv_cache (dict[int, tuple[torch.Tensor, torch.Tensor]]): KV-cache
                 dict to pass through to the decoder.
             device (torch.device): Target device.
+            gradient_checkpointing (bool): If True, enables gradient
+                checkpointing on the decoder blocks.
 
         Returns:
             LanguageModel: Fully initialised language model.
@@ -742,5 +738,6 @@ class LanguageModel(nn.Module):
             kv_cache=kv_cache,
             dropout_rate=config.dropout_rate,
             device=device,
+            gradient_checkpointing=gradient_checkpointing,
         )
 

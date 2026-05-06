@@ -52,11 +52,10 @@ def test_grouped_query_attention_preserves_embedding_shape():
     )
     decoder = build_language_model().transformer_decoder
     embeddings = torch.randn(2, 5, 16)
-    mask = decoder.casual_mask[:, :, :, :5, :5]
 
     outputs = attention(
         embeddings=embeddings,
-        mask=mask,
+        is_causal=True,
         kv_cache=None,
         rope_cos=decoder.rope_cos,
         rope_sin=decoder.rope_sin,
