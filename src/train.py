@@ -18,8 +18,10 @@ from src.transformer import (
     LanguageModel,
     ModelConfig,
     compile_language_model,
+    forward_backward_micro_step,
     get_supported_weights_precision,
     language_model_loss,
+    optimizer_step,
     training_step,
 )
 
@@ -48,6 +50,7 @@ class TrainingConfig:
     device: str
     compile_model: bool
     gradient_checkpointing: bool
+    gradient_accumulation_steps: int
     seed: int
     log_every_tokens: int
     val_every_iterations: int
@@ -161,6 +164,7 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "device": config.device,
         "compile_model": config.compile_model,
         "gradient_checkpointing": config.gradient_checkpointing,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
         "seed": config.seed,
         "log_every_tokens": config.log_every_tokens,
         "val_every_iterations": config.val_every_iterations,
@@ -232,6 +236,7 @@ def load_training_config(config_path: Path) -> TrainingConfig:
         device=str(training.get("device", "auto")),
         compile_model=bool(training.get("compile_model", False)),
         gradient_checkpointing=bool(training.get("gradient_checkpointing", False)),
+        gradient_accumulation_steps=int(training.get("gradient_accumulation_steps", 1)),
         seed=int(training.get("seed", 42)),
         log_every_tokens=int(training.get("log_every_tokens", 2048)),
         val_every_iterations=int(training.get("val_every_iterations", 500)),
@@ -279,6 +284,8 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("log_every_tokens must be greater than 0")
     if config.val_every_iterations <= 0:
         raise ValueError("val_every_iterations must be greater than 0")
+    if config.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
 
 
 def resolve_data_dir(data_dir: Path) -> Path:
@@ -619,32 +626,50 @@ def train(config: TrainingConfig) -> None:
         )
 
         while True:
-            try:
-                inputs, targets = pre_training_dataset.get_sequential_batch("train")
-            except StopIteration:
-                break
             if config.max_iterations is not None and optimizer_steps >= config.max_iterations:
                 break
 
-            tokens_in_batch = inputs.numel()
+            optimizer.zero_grad(set_to_none=True)
+            accumulated_loss = 0.0
+            tokens_in_optimizer_step = 0
+
+            for _ in range(config.gradient_accumulation_steps):
+                try:
+                    inputs, targets = pre_training_dataset.get_sequential_batch("train")
+                except StopIteration:
+                    break
+                tokens_in_micro_batch = inputs.numel()
+                micro_loss = forward_backward_micro_step(
+                    language_model=language_model,
+                    scaler=scaler,
+                    inputs=inputs,
+                    targets=targets,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    use_amp=use_amp,
+                    loss_scale=1.0 / config.gradient_accumulation_steps,
+                )
+                accumulated_loss += micro_loss
+                tokens_in_optimizer_step += tokens_in_micro_batch
+
+            if tokens_in_optimizer_step == 0:
+                break
+
             optimizer_steps += 1
             learning_rate = get_learning_rate(config, optimizer_steps)
             set_optimizer_learning_rate(optimizer, learning_rate)
-            loss = training_step(
+            optimizer_step(
                 language_model=language_model,
                 optimizer=optimizer,
                 scaler=scaler,
-                inputs=inputs,
-                targets=targets,
-                device=device,
-                amp_dtype=amp_dtype,
-                use_amp=use_amp,
                 max_grad_norm=config.max_grad_norm,
             )
-            train_tokens_seen += tokens_in_batch
-            train_token_loss += loss * tokens_in_batch
+
+            loss = accumulated_loss / config.gradient_accumulation_steps
+            train_tokens_seen += tokens_in_optimizer_step
+            train_token_loss += loss * tokens_in_optimizer_step
             avg_train_loss = train_token_loss / train_tokens_seen
-            progress.update(tokens_in_batch)
+            progress.update(tokens_in_optimizer_step)
             progress.set_postfix(loss=f"{avg_train_loss:.4f}", lr=f"{learning_rate:.2e}")
 
             if train_tokens_seen >= next_log_tokens:

@@ -141,6 +141,72 @@ def language_model_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Te
     )
 
 
+def forward_backward_micro_step(
+    language_model: nn.Module,
+    scaler: torch.amp.GradScaler,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    use_amp: bool,
+    loss_scale: float = 1.0,
+) -> float:
+    """
+    Run one forward+backward pass for a single micro-batch.
+
+    Multiplies the loss by loss_scale before backpropagation; set
+    loss_scale = 1 / gradient_accumulation_steps so gradients average
+    correctly across an accumulation window. Does not zero gradients or
+    step the optimizer.
+
+    Args:
+        language_model (nn.Module): The model being trained.
+        scaler (torch.amp.GradScaler): Gradient scaler for mixed-precision.
+        inputs (torch.Tensor): Input token IDs of shape (B, T).
+        targets (torch.Tensor): Target token IDs of shape (B, T).
+        device (torch.device): Device that tensors are moved to.
+        amp_dtype (torch.dtype): dtype used inside the autocast region.
+        use_amp (bool): Whether to enable automatic mixed precision.
+        loss_scale (float): Multiplier applied to the loss before backward.
+
+    Returns:
+        float: The raw (unscaled) scalar loss for this micro-batch.
+    """
+    language_model.train()
+    inputs, targets = inputs.to(device), targets.to(device)
+    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+        logits = language_model(inputs)
+        loss = language_model_loss(logits, targets)
+
+    # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
+    # GradScaler is disabled and these calls are no-ops/pass-throughs.
+    scaler.scale(loss * loss_scale).backward()
+    return float(loss.detach().item())
+
+
+def optimizer_step(
+    language_model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    max_grad_norm: float | None = 1.0,
+) -> None:
+    """
+    Unscale accumulated gradients, clip them, step the optimizer, and update the scaler.
+
+    Args:
+        language_model (nn.Module): The model whose parameters are updated.
+        optimizer (torch.optim.Optimizer): The optimizer.
+        scaler (torch.amp.GradScaler): Gradient scaler; updated after the step.
+        max_grad_norm (float | None): Maximum L2 gradient norm for clipping.
+            Pass None to disable clipping.
+    """
+    if max_grad_norm is not None:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=max_grad_norm)
+    scaler.step(optimizer)
+    scaler.update()
+
+
 def training_step(
     language_model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -150,17 +216,19 @@ def training_step(
     device: torch.device,
     amp_dtype: torch.dtype,
     use_amp: bool,
-    max_grad_norm: float | None = 1.0
+    max_grad_norm: float | None = 1.0,
 ) -> float:
     """
     Run one forward-backward-optimizer step with AMP support.
 
+    Convenience wrapper for a single accumulation step. For gradient
+    accumulation, call forward_backward_micro_step and optimizer_step
+    directly from the training loop.
+
     Args:
         language_model (nn.Module): The model being trained.
-        optimizer (torch.optim.Optimizer): Optimizer holding the parameter
-            groups.
-        scaler (torch.amp.GradScaler): Gradient scaler for mixed-precision
-            training.
+        optimizer (torch.optim.Optimizer): Optimizer holding the parameter groups.
+        scaler (torch.amp.GradScaler): Gradient scaler for mixed-precision.
         inputs (torch.Tensor): Input token IDs of shape (B, T).
         targets (torch.Tensor): Target token IDs of shape (B, T).
         device (torch.device): Device that tensors are moved to.
@@ -172,26 +240,12 @@ def training_step(
     Returns:
         float: The scalar training loss for this step.
     """
-    language_model.train()
     optimizer.zero_grad(set_to_none=True)
-
-    inputs, targets = inputs.to(device), targets.to(device)
-    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-        logits = language_model(inputs)
-        loss = language_model_loss(logits, targets)
-
-    # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
-    # GradScaler is disabled and these calls become no-ops/pass-throughs.
-    scaler.scale(loss).backward()
-
-    if max_grad_norm is not None:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=max_grad_norm)
-
-    scaler.step(optimizer)
-    scaler.update()
-
-    return float(loss.detach().item())
+    loss = forward_backward_micro_step(
+        language_model, scaler, inputs, targets, device, amp_dtype, use_amp
+    )
+    optimizer_step(language_model, optimizer, scaler, max_grad_norm)
+    return loss
 
 
 def compile_language_model(language_model: nn.Module, enabled: bool) -> nn.Module:
