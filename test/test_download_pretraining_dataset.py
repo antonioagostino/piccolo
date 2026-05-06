@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from src.download_pretraining_dataset import (
+from src.utils.download_pretraining_dataset import (
     build_download_plan,
     is_culturax_language_file,
     local_culturax_filename,

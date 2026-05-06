@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from src.train import get_learning_rate, load_training_config, train
-from src.training_budget import estimate_token_budget
+from src.utils.training_budget import estimate_token_budget
 
 
 def test_train_runs_from_yaml_config(tmp_path: Path):

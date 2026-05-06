@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from src.train import load_training_config
-from src.training_budget import print_token_budget_estimate
+from src.utils.training_budget import print_token_budget_estimate
 
 
 def parse_args() -> argparse.Namespace:
