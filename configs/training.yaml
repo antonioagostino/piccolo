@@ -17,6 +17,7 @@ training:
   seed: 42
   log_every_tokens: 2048
   val_every_iterations: 500
+  val_max_iterations: 50
   checkpoint_dir: ./checkpoints
   wandb:
     enabled: true

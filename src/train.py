@@ -21,8 +21,7 @@ from src.transformer import (
     forward_backward_micro_step,
     get_supported_weights_precision,
     language_model_loss,
-    optimizer_step,
-    training_step,
+    optimizer_step
 )
 
 
@@ -54,6 +53,7 @@ class TrainingConfig:
     seed: int
     log_every_tokens: int
     val_every_iterations: int
+    val_max_iterations: int | None
     checkpoint_dir: Path
     wandb: WandbConfig
 
@@ -168,6 +168,7 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "seed": config.seed,
         "log_every_tokens": config.log_every_tokens,
         "val_every_iterations": config.val_every_iterations,
+        "val_max_iterations": config.val_max_iterations,
         "checkpoint_dir": str(config.checkpoint_dir),
         "wandb": {
             "enabled": config.wandb.enabled,
@@ -240,6 +241,11 @@ def load_training_config(config_path: Path) -> TrainingConfig:
         seed=int(training.get("seed", 42)),
         log_every_tokens=int(training.get("log_every_tokens", 2048)),
         val_every_iterations=int(training.get("val_every_iterations", 500)),
+        val_max_iterations=(
+            None
+            if training.get("val_max_iterations") is None
+            else int(training["val_max_iterations"])
+        ),
         checkpoint_dir=Path(training.get("checkpoint_dir", "./checkpoints")),
         wandb=WandbConfig(
             enabled=bool(wandb_config.get("enabled", True)),
@@ -284,6 +290,8 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("log_every_tokens must be greater than 0")
     if config.val_every_iterations <= 0:
         raise ValueError("val_every_iterations must be greater than 0")
+    if config.val_max_iterations is not None and config.val_max_iterations <= 0:
+        raise ValueError("val_max_iterations must be greater than 0 when configured")
     if config.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
 
@@ -588,8 +596,6 @@ def train(config: TrainingConfig) -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
     logger = build_logger(config, model_config)
 
-    val_iterations = int(config.val_every_iterations * (1 - config.train_split_size))
-
     optimizer_steps = 0
     train_tokens_seen = 0
     train_token_loss = 0.0
@@ -613,7 +619,7 @@ def train(config: TrainingConfig) -> None:
                 device=device,
                 amp_dtype=amp_dtype,
                 use_amp=use_amp,
-                max_iterations=val_iterations if val_iterations > 0 else None,
+                max_iterations=config.val_max_iterations,
             )
 
             language_model.train()
