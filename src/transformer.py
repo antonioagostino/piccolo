@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Union, cast
+import math
 import random
 import torch
 from torch import nn
@@ -720,8 +721,11 @@ class LanguageModel(nn.Module):
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         self.dropout_rate = dropout_rate
-        self.embedding_matrix = nn.Embedding(vocab_size,
-                                             embedding_dim)
+        self.embedding_matrix = nn.Embedding(vocab_size, embedding_dim)
+        # N(0, 1/sqrt(D)) keeps logit variance ≈ 1 after the weight-tied LM
+        # head, giving cross-entropy ≈ ln(vocab_size) at random init.
+        nn.init.normal_(self.embedding_matrix.weight, mean=0.0,
+                        std=1.0 / math.sqrt(embedding_dim))
         self.transformer_decoder = TransformerDecoder(
             n_blocks=n_decoder_blocks,
             sequence_length=sequence_length,
