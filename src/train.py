@@ -20,8 +20,7 @@ from src.transformer import (
     compile_language_model,
     forward_backward_micro_step,
     get_supported_weights_precision,
-    language_model_loss,
-    optimizer_step
+    optimizer_step,
 )
 
 
@@ -507,8 +506,7 @@ def validate(
             reset_inference_state(language_model)
             inputs, targets = inputs.to(device), targets.to(device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                logits = language_model(inputs)
-                loss = language_model_loss(logits, targets)
+                loss = language_model(inputs, targets=targets)
 
             tokens_in_batch = inputs.numel()
             total_tokens += tokens_in_batch

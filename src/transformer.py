@@ -25,7 +25,7 @@ class ModelConfig:
         dropout_rate (float): Dropout probability applied to attention and FFN
             outputs.
         ffn_hidden_dim (int | None): Hidden dimension of the SwiGLU FFN. If
-            None, defaults to 4 × embedding_dim.
+            None, defaults to 4 x embedding_dim.
     """
 
     vocab_size: int
@@ -69,7 +69,7 @@ class ModelConfig:
     @property
     def resolved_ffn_hidden_dim(self) -> int:
         """
-        FFN hidden dimension, falling back to 4 × embedding_dim when unset.
+        FFN hidden dimension, falling back to 4 x embedding_dim when unset.
 
         Returns:
             int: The effective hidden dimension of the SwiGLU feed-forward
@@ -125,6 +125,38 @@ def get_supported_weights_precision(device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def chunked_cross_entropy_loss(
+    hidden_states: torch.Tensor,
+    embedding_weight: torch.Tensor,
+    targets: torch.Tensor,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """
+    Cross-entropy loss without materializing the full (B*T, vocab_size) logits tensor.
+
+    Splits the flattened token sequence into chunks of `chunk_size`, computes
+    logits and cross-entropy for each chunk independently, then returns the
+    mean loss over all tokens.
+
+    Peak extra VRAM is O(chunk_size x vocab_size) instead of O(B x T x vocab_size).
+    PyTorch's autograd processes the summed chunk losses in reverse order during
+    backward, so at most one chunk's saved tensors are live simultaneously.
+    """
+    B, T, D = hidden_states.shape
+    hidden_flat  = hidden_states.view(B * T, D)
+    targets_flat = targets.contiguous().view(B * T)
+
+    total_loss = hidden_states.new_zeros(())
+    for start in range(0, B * T, chunk_size):
+        end          = min(start + chunk_size, B * T)
+        chunk_logits = F.linear(hidden_flat[start:end], embedding_weight)  # (chunk, V)
+        chunk_loss   = F.cross_entropy(chunk_logits, targets_flat[start:end], reduction="sum")
+        total_loss   = total_loss + chunk_loss
+        del chunk_logits
+
+    return total_loss / (B * T)
+
+
 def language_model_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """
     Compute cross-entropy loss over a batch of next-token predictions.
@@ -176,8 +208,7 @@ def forward_backward_micro_step(
     language_model.train()
     inputs, targets = inputs.to(device), targets.to(device)
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-        logits = language_model(inputs)
-        loss = language_model_loss(logits, targets)
+        loss = language_model(inputs, targets=targets)
 
     # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
     # GradScaler is disabled and these calls are no-ops/pass-throughs.
@@ -513,7 +544,7 @@ class TransformerDecoder(nn.Module):
             n_heads (int): Number of query attention heads.
             n_kv_heads (int): Number of key/value heads.
             ffn_hidden_dim (int | None): SwiGLU hidden dimension; defaults to
-                4 × embedding_dim when None.
+                4 x embedding_dim when None.
             kv_cache (dict[int, tuple[torch.Tensor, torch.Tensor]]): Shared
                 KV-cache dict updated in-place during inference. Pass an empty
                 dict for training.
@@ -744,26 +775,34 @@ class LanguageModel(nn.Module):
             device=device
         )
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, targets: torch.Tensor | None = None) -> torch.Tensor:
         """
-        Compute next-token logits for a batch of token sequences.
+        Compute next-token logits or training loss for a batch of token sequences.
 
         Args:
             x (torch.Tensor): Integer token IDs of shape (B, T).
+            targets (torch.Tensor | None): Target token IDs of shape (B, T).
+                When provided, returns a scalar cross-entropy loss computed via
+                chunked_cross_entropy_loss (no full (B,T,V) logits materialized).
+                When None, returns logits of shape (B, T, vocab_size) for inference.
 
         Returns:
-            torch.Tensor: Logits of shape (B, T, vocab_size).
+            torch.Tensor: Scalar loss when targets is given; logits (B, T, vocab_size)
+                otherwise.
         """
         tokens = x                                 # (B, T)
         embeddings = self.embedding_matrix(tokens) # (B, T, D)
         out = self.transformer_decoder(embeddings) # (B, T, D)
+        normed = self.final_norm(out)              # (B, T, D)
+
+        if targets is not None:
+            return chunked_cross_entropy_loss(normed, self.embedding_matrix.weight, targets)
+
         # Remember that torch.nn.functional.linear transposes the weight matrix
         # passed before applying the affine linear transformation, so we don't
         # need to compute the transpose of the embedding matrix to get back to
         # vocab space.
-        logits = F.linear(self.final_norm(out), self.embedding_matrix.weight) # (B, T, vocab_size)
-
-        return logits
+        return F.linear(normed, self.embedding_matrix.weight)  # (B, T, vocab_size)
 
     @classmethod
     def from_config(cls,
