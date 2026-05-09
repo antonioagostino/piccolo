@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Union
 import random
+import numpy as np
 import pandas as pd
 import torch
 from src.tokenizer import Tokenizer, TiktokenTokenizer
@@ -368,4 +369,68 @@ class PreTrainingDataset:
             del self.tokens_buffer[split][:self.sequence_length]
 
         return torch.stack(x), torch.stack(y)
+
+
+class TokenizedDataset:
+    """
+    Pre-tokenized dataset backed by numpy memmap binary files.
+
+    Reads train.bin and val.bin produced by src.utils.tokenize_dataset.
+    Each file is a flat stream of uint32 token IDs. Batches are drawn
+    non-overlapping with a persistent offset cursor per split; call
+    reset_split() to rewind to the beginning.
+    """
+
+    def __init__(
+        self,
+        data_dir: Union[str, Path],
+        sequence_length: int,
+        batch_size: int,
+    ) -> None:
+        data_dir = Path(data_dir)
+        meta_path = data_dir / "metadata.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"metadata.json not found in {data_dir}. "
+                "Run `python -m src.utils.tokenize_dataset` first."
+            )
+
+        self.sequence_length = sequence_length
+        self.batch_size = batch_size
+
+        self._mmap: dict[str, np.ndarray] = {
+            "train": np.memmap(data_dir / "train.bin", dtype=np.uint32, mode="r"),
+            "val":   np.memmap(data_dir / "val.bin",   dtype=np.uint32, mode="r"),
+        }
+        self._offset: dict[str, int] = {"train": 0, "val": 0}
+
+    def reset_split(self, split: str) -> None:
+        """Rewind the read cursor for the given split to the beginning."""
+        self._offset[split] = 0
+
+    def get_sequential_batch(self, split: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return the next non-overlapping batch from the given split.
+
+        Raises:
+            StopIteration: When fewer than batch_size * sequence_length + 1
+                tokens remain.
+        """
+        assert split in ("train", "val")
+        tokens_needed = self.batch_size * self.sequence_length + 1
+        start = self._offset[split]
+        mmap = self._mmap[split]
+
+        if start + tokens_needed > len(mmap):
+            raise StopIteration
+
+        # np.array() copies the slice out of the memmap so we don't keep the
+        # page pinned; cast to int64 for torch embedding look-ups.
+        chunk = np.array(mmap[start : start + tokens_needed], dtype=np.int64)
+
+        x = torch.from_numpy(chunk[:-1].reshape(self.batch_size, self.sequence_length))
+        y = torch.from_numpy(chunk[1:].reshape(self.batch_size, self.sequence_length))
+
+        self._offset[split] += self.batch_size * self.sequence_length
+        return x, y
 

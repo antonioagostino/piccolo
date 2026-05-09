@@ -4,12 +4,12 @@ import pandas as pd
 import pytest
 
 from src.train import get_learning_rate, load_training_config, train
-from src.utils.training_budget import estimate_token_budget
+from src.utils.tokenize_dataset import tokenize_dataset
 
 
 def test_train_runs_from_yaml_config(tmp_path: Path):
-    data_dir = tmp_path / "data"
-    dataset_file = data_dir / "raw_text" / "CulturaX" / "dataset_file.parquet"
+    raw_dir = tmp_path / "data" / "raw_text"
+    dataset_file = raw_dir / "CulturaX" / "dataset_file.parquet"
     dataset_file.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         {
@@ -19,6 +19,15 @@ def test_train_runs_from_yaml_config(tmp_path: Path):
             ]
         }
     ).to_parquet(dataset_file, engine="auto", index=False)
+
+    tokenized_dir = tmp_path / "data" / "tokenized"
+    tokenize_dataset(
+        data_dir=raw_dir,
+        output_dir=tokenized_dir,
+        encoding="cl100k_base",
+        train_split=0.5,
+        seed=0,
+    )
 
     model_config_path = tmp_path / "model.yaml"
     model_config_path.write_text(
@@ -43,9 +52,8 @@ def test_train_runs_from_yaml_config(tmp_path: Path):
         "\n".join(
             [
                 "training:",
-                f"  data_dir: {data_dir}",
+                f"  data_dir: {tokenized_dir}",
                 f"  model_config: {model_config_path}",
-                "  train_split_size: 0.5",
                 "  batch_size: 1",
                 "  learning_rate: 0.001",
                 "  min_learning_rate: 0.0001",
@@ -92,49 +100,28 @@ def test_learning_rate_uses_warmup_then_cosine_decay(tmp_path: Path):
     assert get_learning_rate(config, 7) == pytest.approx(0.1)
 
 
-def test_estimate_token_budget_returns_full_pass_iterations(tmp_path: Path):
-    data_dir = tmp_path / "data"
-    dataset_file = data_dir / "raw_text" / "CulturaX" / "dataset_file.parquet"
+def test_tokenized_dataset_token_counts_match_metadata(tmp_path: Path):
+    raw_dir = tmp_path / "raw_text"
+    dataset_file = raw_dir / "CulturaX" / "dataset_file.parquet"
     dataset_file.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"text": ["hello world " * 10, "training tokens " * 10]}).to_parquet(
         dataset_file,
         engine="auto",
         index=False,
     )
-    model_config_path = tmp_path / "model.yaml"
-    model_config_path.write_text(
-        "\n".join(
-            [
-                "model:",
-                "  vocab_size: 100277",
-                "  sequence_length: 4",
-                "  embedding_dim: 16",
-                "  n_decoder_blocks: 1",
-                "  n_heads: 4",
-                "  n_kv_heads: 2",
-                "  ffn_hidden_dim: 32",
-                "  dropout_rate: 0.0",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    training_config_path = tmp_path / "training.yaml"
-    training_config_path.write_text(
-        "\n".join(
-            [
-                "training:",
-                f"  data_dir: {data_dir}",
-                f"  model_config: {model_config_path}",
-                "  train_split_size: 1.0",
-                "  batch_size: 2",
-                "  wandb:",
-                "    enabled: false",
-            ]
-        ),
-        encoding="utf-8",
+
+    tokenized_dir = tmp_path / "tokenized"
+    tokenize_dataset(
+        data_dir=raw_dir,
+        output_dir=tokenized_dir,
+        encoding="cl100k_base",
+        train_split=1.0,
+        seed=0,
     )
 
-    estimate = estimate_token_budget(load_training_config(training_config_path))
+    import json, numpy as np
+    meta = json.loads((tokenized_dir / "metadata.json").read_text())
+    train_tokens = np.memmap(tokenized_dir / "train.bin", dtype="uint32", mode="r")
 
-    assert estimate.tokens_per_iteration == 8
-    assert estimate.train_iterations == estimate.split_token_counts.train_tokens // 8
+    assert meta["train_tokens"] == len(train_tokens)
+    assert meta["val_tokens"] == 0

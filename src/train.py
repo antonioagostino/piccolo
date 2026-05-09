@@ -12,7 +12,7 @@ import torch
 import yaml
 from tqdm.auto import tqdm  # type: ignore[import-untyped]
 
-from src.dataset import PreTrainingDataset
+from src.dataset import TokenizedDataset
 from src.tokenizer import TiktokenTokenizer
 from src.transformer import (
     LanguageModel,
@@ -38,7 +38,6 @@ class TrainingConfig:
     data_dir: Path
     model_config: Path
     tokenizer_encoding: str
-    train_split_size: float
     batch_size: int
     learning_rate: float
     min_learning_rate: float
@@ -153,7 +152,6 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "data_dir": str(config.data_dir),
         "model_config": str(config.model_config),
         "tokenizer_encoding": config.tokenizer_encoding,
-        "train_split_size": config.train_split_size,
         "batch_size": config.batch_size,
         "learning_rate": config.learning_rate,
         "min_learning_rate": config.min_learning_rate,
@@ -219,10 +217,9 @@ def load_training_config(config_path: Path) -> TrainingConfig:
     wandb_config = as_mapping(training.get("wandb", {}), "training.wandb")
 
     return TrainingConfig(
-        data_dir=Path(training.get("data_dir", "./data")),
+        data_dir=Path(training.get("data_dir", "./data/tokenized")),
         model_config=Path(training.get("model_config", "./configs/model.yaml")),
         tokenizer_encoding=str(training.get("tokenizer_encoding", "cl100k_base")),
-        train_split_size=float(training.get("train_split_size", 0.9)),
         batch_size=int(training.get("batch_size", 4)),
         learning_rate=float(training.get("learning_rate", 3e-4)),
         min_learning_rate=float(training.get("min_learning_rate", 3e-5)),
@@ -266,8 +263,6 @@ def validate_config(config: TrainingConfig) -> None:
     Raises:
         ValueError: If any field is out of range or logically inconsistent.
     """
-    if not 0.0 < config.train_split_size <= 1.0:
-        raise ValueError("train_split_size must be in the interval (0, 1]")
     if config.batch_size <= 0:
         raise ValueError("batch_size must be greater than 0")
     if config.learning_rate <= 0:
@@ -294,21 +289,6 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("val_max_iterations must be greater than 0 when configured")
     if config.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
-
-
-def resolve_data_dir(data_dir: Path) -> Path:
-    """
-    Resolve the effective data directory, descending into ``raw_text`` if present.
-
-    Args:
-        data_dir (Path): Base data directory from the training config.
-
-    Returns:
-        Path: The resolved directory containing dataset sub-folders.
-    """
-    if (data_dir / "raw_text").is_dir():
-        return data_dir / "raw_text"
-    return data_dir
 
 
 def resolve_device(requested_device: str) -> torch.device:
@@ -480,7 +460,7 @@ def save_checkpoint(
 
 def validate(
     language_model: torch.nn.Module,
-    pre_training_dataset: PreTrainingDataset,
+    dataset: TokenizedDataset,
     device: torch.device,
     amp_dtype: torch.dtype,
     use_amp: bool,
@@ -492,8 +472,7 @@ def validate(
     Args:
         language_model (torch.nn.Module): The model to evaluate (set to eval
             mode internally).
-        pre_training_dataset (PreTrainingDataset): Dataset whose validation
-            split is consumed sequentially.
+        dataset (TokenizedDataset): Dataset whose validation split is read.
         device (torch.device): Device that tensors are moved to.
         amp_dtype (torch.dtype): dtype used inside the autocast region.
         use_amp (bool): Whether to enable automatic mixed precision.
@@ -504,6 +483,7 @@ def validate(
         float | None: Mean per-token cross-entropy loss over the evaluated
             batches, or None if no validation batches were produced.
     """
+    dataset.reset_split("val")
     language_model.eval()
     total_token_loss = 0.0
     total_tokens = 0
@@ -519,7 +499,7 @@ def validate(
             if max_iterations is not None and iteration >= max_iterations:
                 break
             try:
-                inputs, targets = pre_training_dataset.get_sequential_batch("val")
+                inputs, targets = dataset.get_sequential_batch("val")
             except StopIteration:
                 break
             iteration += 1
@@ -562,9 +542,9 @@ def train(config: TrainingConfig) -> None:
     validate_config(config)
     seed_everything(config.seed)
 
-    data_dir = resolve_data_dir(config.data_dir)
+    data_dir = config.data_dir
     if not data_dir.is_dir():
-        raise ValueError(f"{config.data_dir} is not a valid data directory")
+        raise ValueError(f"{data_dir} is not a valid data directory")
 
     device = resolve_device(config.device)
     amp_dtype = get_supported_weights_precision(device)
@@ -602,20 +582,16 @@ def train(config: TrainingConfig) -> None:
     next_log_tokens = config.log_every_tokens
     best_val_loss = float("inf")
     try:
-        pre_training_dataset = PreTrainingDataset(
-            str(data_dir),
-            model_config.sequence_length,
-            config.train_split_size,
-            config.batch_size,
-            tokenizer,
-            device,
-            random_seed=config.seed,
+        dataset = TokenizedDataset(
+            data_dir=data_dir,
+            sequence_length=model_config.sequence_length,
+            batch_size=config.batch_size,
         )
 
         def _run_validation() -> float | None:
             result = validate(
                 language_model=language_model,
-                pre_training_dataset=pre_training_dataset,
+                dataset=dataset,
                 device=device,
                 amp_dtype=amp_dtype,
                 use_amp=use_amp,
@@ -641,7 +617,7 @@ def train(config: TrainingConfig) -> None:
 
             for _ in range(config.gradient_accumulation_steps):
                 try:
-                    inputs, targets = pre_training_dataset.get_sequential_batch("train")
+                    inputs, targets = dataset.get_sequential_batch("train")
                 except StopIteration:
                     break
                 tokens_in_micro_batch = inputs.numel()
