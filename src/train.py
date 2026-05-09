@@ -550,6 +550,7 @@ def train(config: TrainingConfig) -> None:
     amp_dtype = get_supported_weights_precision(device)
     use_amp = device.type == "cuda"
     use_grad_scaler = use_amp and amp_dtype == torch.float16
+    torch.set_float32_matmul_precision("high")
 
     model_config = ModelConfig.from_yaml(config.model_config)
     tokenizer = TiktokenTokenizer(config.tokenizer_encoding)

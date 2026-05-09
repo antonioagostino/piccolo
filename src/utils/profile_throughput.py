@@ -174,6 +174,7 @@ def profile_throughput(
     amp_dtype    = get_supported_weights_precision(device)
     use_amp      = device.type == "cuda"
     use_scaler   = use_amp and amp_dtype == torch.float16
+    torch.set_float32_matmul_precision("high")
 
     print(f"\nLoading tokenized dataset from {config.data_dir} …")
     dataset = TokenizedDataset(
