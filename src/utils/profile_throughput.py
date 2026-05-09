@@ -127,6 +127,7 @@ def _report(
     tokens_per_batch: int,
     step_s: float,
     compiled: bool,
+    target_tokens: float,
 ) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     flops_per_token = 6 * n_params
@@ -140,7 +141,6 @@ def _report(
         else None
     )
 
-    target_tokens = 6.4e9
     hours = target_tokens / throughput / 3600
 
     print()
@@ -157,7 +157,7 @@ def _report(
     if mfu is not None:
         print(f"  MFU               : {mfu:.1f}%")
     print()
-    print(f"  Time to train 6.4 B tokens : {hours:,.0f} h  ({hours / 24:.1f} days)")
+    print(f"  Time to train {_fmt(target_tokens)} tokens : {hours:,.0f} h  ({hours / 24:.1f} days)")
     print("=" * 56)
     print()
 
@@ -171,6 +171,7 @@ def profile_throughput(
     n_warmup: int,
     n_batches: int,
     gpu: str | None,
+    target_tokens: float,
 ) -> None:
     config       = load_training_config(config_path)
     model_config = ModelConfig.from_yaml(config.model_config)
@@ -216,6 +217,7 @@ def profile_throughput(
         tokens_per_batch=tokens_per_batch,
         step_s=step_s,
         compiled=config.compile_model,
+        target_tokens=target_tokens,
     )
 
 
@@ -240,9 +242,13 @@ def _parse_args() -> argparse.Namespace:
         "--gpu", type=str, default="A100_40GB",
         help=f"GPU model for MFU calculation. Known: {', '.join(GPU_TFLOPS)}.",
     )
+    parser.add_argument(
+        "--target-tokens", type=float, default=6.4e9,
+        help="Number of tokens to project training time for (default: 6.4B).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    profile_throughput(args.config, args.n_warmup, args.n_batches, args.gpu)
+    profile_throughput(args.config, args.n_warmup, args.n_batches, args.gpu, args.target_tokens)
