@@ -449,16 +449,25 @@ class GroupedQueryAttention(nn.Module):
         q = self.apply_rope(q, rope_cos, rope_sin, offset)
         k = self.apply_rope(k, rope_cos, rope_sin, offset)
 
+        # Collapse the GQA group dimension so SDPA sees standard 4-D tensors
+        # [B, G, H//G, T, HS] → [B, H, T, HS]  and  [B, G, 1, T, HS] → [B, G, T, HS].
+        # This is required for PyTorch to dispatch to FlashAttention; the 5-D
+        # layout forces the slow math kernel and materialises the full O(T²) matrix.
+        q = q.reshape(B, H, T, self.head_size)
+        k = k.squeeze(2)   # [B, G, T, HS]
+        v = v.squeeze(2)   # [B, G, T, HS]
+
         if not self.training and kv_cache is not None:
             if self.layer_idx in kv_cache.keys():
                 past_k, past_v = kv_cache[self.layer_idx]
-                k = torch.cat([past_k, k], dim=3)[:, :, :, -self.sequence_length:, :]
-                v = torch.cat([past_v, v], dim=3)[:, :, :, -self.sequence_length:, :]
+                k = torch.cat([past_k, k], dim=2)[:, :, -self.sequence_length:, :]
+                v = torch.cat([past_v, v], dim=2)[:, :, -self.sequence_length:, :]
 
             kv_cache[self.layer_idx] = (k, v)
 
         outputs = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal, enable_gqa=True)
-        outputs = outputs.permute(0, 3, 1, 2, 4).contiguous().view(B, T, self.embedding_dim)
+        # [B, H, T, HS] → [B, T, H, HS] → [B, T, D]
+        outputs = outputs.transpose(1, 2).contiguous().view(B, T, self.embedding_dim)
         y = self.output_proj(outputs)
 
         return y
