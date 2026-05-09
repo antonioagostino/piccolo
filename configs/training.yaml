@@ -12,7 +12,7 @@ training:
   device: auto
   compile_model: true
   gradient_checkpointing: false
-  gradient_accumulation_steps: 32
+  gradient_accumulation_steps: 20
   seed: 42
   log_every_tokens: 2048
   val_every_iterations: 500
