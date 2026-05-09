@@ -95,17 +95,21 @@ def _run(
     print(f"  Running {n_warmup} {label} iterations …", flush=True)
 
     for _ in range(n_warmup):
+        model.zero_grad(set_to_none=True)
         x, y = _next_batch(dataset, "train")
         x, y = x.to(device), y.to(device)
         forward_backward_micro_step(model, scaler, x, y, device, amp_dtype, use_amp)
+        scaler.update()
     _sync(device)
 
     print(f"  Timing {n_batches} iterations …", flush=True)
     t0 = time.perf_counter()
     for _ in range(n_batches):
+        model.zero_grad(set_to_none=True)
         x, y = _next_batch(dataset, "train")
         x, y = x.to(device), y.to(device)
         forward_backward_micro_step(model, scaler, x, y, device, amp_dtype, use_amp)
+        scaler.update()
     _sync(device)
 
     return (time.perf_counter() - t0) / n_batches
