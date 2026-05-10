@@ -2,21 +2,21 @@ training:
   data_dir: ./data/tokenized
   model_config: ./configs/model.yaml
   tokenizer_encoding: cl100k_base
-  batch_size: 16
+  batch_size: 18
   learning_rate: 0.0003
   min_learning_rate: 0.00003
   lr_warmup_iterations: 500
-  max_iterations: 344840
+  max_iterations: 8906
   weight_decay: 0.01
   max_grad_norm: 1.0
   device: auto
   compile_model: true
   gradient_checkpointing: false
-  gradient_accumulation_steps: 20
+  gradient_accumulation_steps: 18
   seed: 42
   log_every_tokens: 2048
   val_every_iterations: 500
-  val_max_iterations: 55
+  val_max_iterations: 52
   checkpoint_dir: ./checkpoints
   wandb:
     enabled: true
