@@ -667,6 +667,8 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
     # even when resuming from a checkpoint with a large initial train_tokens_seen.
     initial_tokens_seen = train_tokens_seen
     train_token_loss = 0.0
+    ema_loss: float | None = None
+    ema_alpha = 0.98
 
     logger = build_logger(config, model_config, resume_run_id=wandb_resume_id or wandb_run_id)
 
@@ -743,13 +745,15 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             train_tokens_seen += tokens_in_optimizer_step
             train_token_loss += loss * tokens_in_optimizer_step
             avg_train_loss = train_token_loss / (train_tokens_seen - initial_tokens_seen)
+            ema_loss = loss if ema_loss is None else ema_alpha * ema_loss + (1 - ema_alpha) * loss
             progress.update(tokens_in_optimizer_step)
-            progress.set_postfix(loss=f"{avg_train_loss:.4f}", lr=f"{learning_rate:.2e}")
+            progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
 
             if train_tokens_seen >= next_log_tokens:
                 logger.log(
                     {
                         "train/loss": loss,
+                        "train/loss_ema": ema_loss,
                         "train/avg_loss": avg_train_loss,
                         "train/tokens_seen": train_tokens_seen,
                         "train/optimizer_steps": optimizer_steps,
