@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import math
 import random
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ class TrainingConfig:
     val_every_iterations: int
     val_max_iterations: int | None
     checkpoint_dir: Path
+    resume_from: Path | None
     wandb: WandbConfig
 
 
@@ -60,6 +62,10 @@ class MetricsLogger:
     """
     No-op metrics logger used as a default when W&B is disabled.
     """
+
+    @property
+    def run_id(self) -> str | None:
+        return None
 
     def log(self, metrics: dict[str, float | int], step: int) -> None:
         """
@@ -86,7 +92,8 @@ class WandbMetricsLogger(MetricsLogger):
     def __init__(self,
                  config: WandbConfig,
                  training_config: TrainingConfig,
-                 model_config: ModelConfig) -> None:
+                 model_config: ModelConfig,
+                 resume_run_id: str | None = None) -> None:
         """
         Initialise and start a W&B run.
 
@@ -96,6 +103,9 @@ class WandbMetricsLogger(MetricsLogger):
                 logged as run metadata.
             model_config (ModelConfig): Model architecture configuration
                 logged as run metadata.
+            resume_run_id (str | None): W&B run ID to resume. When set,
+                metrics are appended to the existing run instead of starting
+                a new one.
 
         Raises:
             RuntimeError: If the ``wandb`` package is not installed.
@@ -113,11 +123,22 @@ class WandbMetricsLogger(MetricsLogger):
             project=config.project,
             name=config.run_name,
             mode=config.mode,
+            id=resume_run_id,
+            resume="must" if resume_run_id is not None else None,
             config={
                 "training": config_to_dict(training_config),
                 "model": model_config.__dict__,
             },
         )
+        # When resuming, skip any step already present in the run so we never
+        # log backwards and trigger a step-ordering error from W&B.
+        self._skip_until_step: int = 0
+        if resume_run_id is not None and self.__run is not None:
+            self._skip_until_step = int(self.__run.summary.get("train/tokens_seen", 0))
+
+    @property
+    def run_id(self) -> str | None:
+        return self.__run.id if self.__run is not None else None
 
     def log(self, metrics: dict[str, float | int], step: int) -> None:
         """
@@ -128,6 +149,8 @@ class WandbMetricsLogger(MetricsLogger):
                 values.
             step (int): Global step index used as the x-axis in W&B charts.
         """
+        if step <= self._skip_until_step:
+            return
         self.__wandb.log(metrics, step=step)
 
     def finish(self) -> None:
@@ -167,6 +190,7 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "val_every_iterations": config.val_every_iterations,
         "val_max_iterations": config.val_max_iterations,
         "checkpoint_dir": str(config.checkpoint_dir),
+        "resume_from": str(config.resume_from) if config.resume_from is not None else None,
         "wandb": {
             "enabled": config.wandb.enabled,
             "project": config.wandb.project,
@@ -243,6 +267,11 @@ def load_training_config(config_path: Path) -> TrainingConfig:
             else int(training["val_max_iterations"])
         ),
         checkpoint_dir=Path(training.get("checkpoint_dir", "./checkpoints")),
+        resume_from=(
+            Path(training["resume_from"])
+            if training.get("resume_from") is not None
+            else None
+        ),
         wandb=WandbConfig(
             enabled=bool(wandb_config.get("enabled", True)),
             project=str(wandb_config.get("project", "friendsbot")),
@@ -288,6 +317,8 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("val_max_iterations must be greater than 0 when configured")
     if config.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
+    if config.resume_from is not None and not config.resume_from.is_file():
+        raise ValueError(f"resume_from path does not exist: {config.resume_from}")
 
 
 def resolve_device(requested_device: str) -> torch.device:
@@ -376,7 +407,11 @@ def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate:
         parameter_group["lr"] = learning_rate
 
 
-def build_logger(config: TrainingConfig, model_config: ModelConfig) -> MetricsLogger:
+def build_logger(
+    config: TrainingConfig,
+    model_config: ModelConfig,
+    resume_run_id: str | None = None,
+) -> MetricsLogger:
     """
     Construct the appropriate metrics logger based on the training config.
 
@@ -385,13 +420,15 @@ def build_logger(config: TrainingConfig, model_config: ModelConfig) -> MetricsLo
             ``config.wandb.enabled`` to choose the logger type.
         model_config (ModelConfig): Model configuration passed to the W&B
             logger for metadata logging.
+        resume_run_id (str | None): W&B run ID to resume. Forwarded to
+            WandbMetricsLogger when W&B is enabled.
 
     Returns:
         MetricsLogger: A WandbMetricsLogger if W&B is enabled, otherwise the
             no-op MetricsLogger.
     """
     if config.wandb.enabled:
-        return WandbMetricsLogger(config.wandb, config, model_config)
+        return WandbMetricsLogger(config.wandb, config, model_config, resume_run_id)
     return MetricsLogger()
 
 
@@ -416,6 +453,39 @@ def reset_inference_state(language_model: torch.nn.Module) -> None:
     transformer_decoder.kv_cache.clear()
 
 
+def load_checkpoint(
+    path: Path,
+    language_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+) -> tuple[int, int, float, float]:
+    """
+    Load a training checkpoint and restore model, optimizer, and scaler state.
+
+    Args:
+        path (Path): Path to the checkpoint file.
+        language_model (torch.nn.Module): Model to restore weights into.
+        optimizer (torch.optim.Optimizer): Optimizer to restore state into.
+        scaler (torch.amp.GradScaler): Grad scaler to restore state into.
+
+    Returns:
+        tuple[int, int, float, float]: ``(optimizer_steps, train_tokens_seen,
+            best_val_loss, train_token_loss)`` read from the checkpoint.
+    """
+    checkpoint = torch.load(path, weights_only=True)
+    model = getattr(language_model, "_orig_mod", language_model)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    return (
+        checkpoint["optimizer_steps"],
+        checkpoint["train_tokens_seen"],
+        checkpoint["val_loss"],
+        checkpoint.get("train_token_loss", 0.0),
+        checkpoint.get("wandb_run_id"),
+    )
+
+
 def save_checkpoint(
     path: Path,
     language_model: torch.nn.Module,
@@ -423,7 +493,9 @@ def save_checkpoint(
     scaler: torch.amp.GradScaler,
     optimizer_steps: int,
     train_tokens_seen: int,
+    train_token_loss: float,
     val_loss: float,
+    wandb_run_id: str | None = None,
 ) -> None:
     """
     Save a training checkpoint to disk.
@@ -439,6 +511,8 @@ def save_checkpoint(
         scaler (torch.amp.GradScaler): The gradient scaler whose state is saved.
         optimizer_steps (int): Number of optimizer steps completed.
         train_tokens_seen (int): Total training tokens processed so far.
+        train_token_loss (float): Cumulative sum of (loss * tokens) used to
+            compute the running average training loss.
         val_loss (float): Validation loss at this checkpoint; use
             ``float("nan")`` when no validation was run.
     """
@@ -451,7 +525,9 @@ def save_checkpoint(
             "scaler_state_dict": scaler.state_dict(),
             "optimizer_steps": optimizer_steps,
             "train_tokens_seen": train_tokens_seen,
+            "train_token_loss": train_token_loss,
             "val_loss": val_loss,
+            "wandb_run_id": wandb_run_id,
         },
         path,
     )
@@ -523,7 +599,7 @@ def validate(
     return total_token_loss / total_tokens
 
 
-def train(config: TrainingConfig) -> None:
+def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
     """Run the full pre-training loop from a TrainingConfig.
 
     Validates the config, initialises the model, optimizer, and dataset,
@@ -573,19 +649,31 @@ def train(config: TrainingConfig) -> None:
         weight_decay=config.weight_decay,
     )
     scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
-    logger = build_logger(config, model_config)
 
     optimizer_steps = 0
     train_tokens_seen = 0
     train_token_loss = 0.0
     next_log_tokens = config.log_every_tokens
     best_val_loss = float("inf")
+    wandb_run_id: str | None = None
+
+    if config.resume_from is not None:
+        optimizer_steps, train_tokens_seen, best_val_loss, train_token_loss, wandb_run_id = load_checkpoint(
+            config.resume_from, language_model, optimizer, scaler
+        )
+        next_log_tokens = (train_tokens_seen // config.log_every_tokens + 1) * config.log_every_tokens
+        set_optimizer_learning_rate(optimizer, get_learning_rate(config, optimizer_steps))
+
+    logger = build_logger(config, model_config, resume_run_id=wandb_resume_id or wandb_run_id)
+
     try:
         dataset = TokenizedDataset(
             data_dir=data_dir,
             sequence_length=model_config.sequence_length,
             batch_size=config.batch_size,
         )
+        if config.resume_from is not None:
+            dataset._offset["train"] = train_tokens_seen
 
         def _run_validation() -> float | None:
             result = validate(
@@ -604,6 +692,7 @@ def train(config: TrainingConfig) -> None:
             desc="\033[1mTraining\033[0m",
             unit=" total tokens",
             bar_format="{desc}: {n_fmt}{unit} [elapsed: {elapsed}, {rate_fmt}{postfix}]",
+            initial=train_tokens_seen,
         )
 
         while True:
@@ -678,16 +767,29 @@ def train(config: TrainingConfig) -> None:
                         },
                         step=train_tokens_seen,
                     )
+                    save_checkpoint(
+                        path=config.checkpoint_dir / "checkpoint_latest.pt",
+                        language_model=language_model,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        optimizer_steps=optimizer_steps,
+                        train_tokens_seen=train_tokens_seen,
+                        train_token_loss=train_token_loss,
+                        val_loss=step_val_loss,
+                        wandb_run_id=logger.run_id,
+                    )
                     if step_val_loss < best_val_loss:
                         best_val_loss = step_val_loss
                         save_checkpoint(
-                            path=config.checkpoint_dir / f"checkpoint_step_{optimizer_steps}.pt",
+                            path=config.checkpoint_dir / "checkpoint_best.pt",
                             language_model=language_model,
                             optimizer=optimizer,
                             scaler=scaler,
                             optimizer_steps=optimizer_steps,
                             train_tokens_seen=train_tokens_seen,
+                            train_token_loss=train_token_loss,
                             val_loss=step_val_loss,
+                            wandb_run_id=logger.run_id,
                         )
 
         progress.close()
@@ -721,7 +823,9 @@ def train(config: TrainingConfig) -> None:
             scaler=scaler,
             optimizer_steps=optimizer_steps,
             train_tokens_seen=train_tokens_seen,
+            train_token_loss=train_token_loss,
             val_loss=final_val_loss if final_val_loss is not None else float("nan"),
+            wandb_run_id=logger.run_id,
         )
     finally:
         logger.finish()
@@ -742,9 +846,24 @@ def parse_args() -> argparse.Namespace:
         default=Path("configs/training.yaml"),
         help="Path to the YAML training config.",
     )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Path to a checkpoint to resume training from.",
+    )
+    parser.add_argument(
+        "--wandb-resume-id",
+        type=str,
+        default=None,
+        help="W&B run ID to resume (overrides the run ID stored in the checkpoint).",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train(load_training_config(args.config))
+    config = load_training_config(args.config)
+    if args.resume_from is not None:
+        config = dataclasses.replace(config, resume_from=args.resume_from)
+    train(config, wandb_resume_id=args.wandb_resume_id)
