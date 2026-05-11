@@ -652,17 +652,21 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
 
     optimizer_steps = 0
     train_tokens_seen = 0
-    train_token_loss = 0.0
     next_log_tokens = config.log_every_tokens
     best_val_loss = float("inf")
     wandb_run_id: str | None = None
 
     if config.resume_from is not None:
-        optimizer_steps, train_tokens_seen, best_val_loss, train_token_loss, wandb_run_id = load_checkpoint(
+        optimizer_steps, train_tokens_seen, best_val_loss, _, wandb_run_id = load_checkpoint(
             config.resume_from, language_model, optimizer, scaler
         )
         next_log_tokens = (train_tokens_seen // config.log_every_tokens + 1) * config.log_every_tokens
         set_optimizer_learning_rate(optimizer, get_learning_rate(config, optimizer_steps))
+
+    # Track loss/tokens from this run's start so avg_loss is always meaningful,
+    # even when resuming from a checkpoint with a large initial train_tokens_seen.
+    initial_tokens_seen = train_tokens_seen
+    train_token_loss = 0.0
 
     logger = build_logger(config, model_config, resume_run_id=wandb_resume_id or wandb_run_id)
 
@@ -738,7 +742,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             loss = accumulated_loss / config.gradient_accumulation_steps
             train_tokens_seen += tokens_in_optimizer_step
             train_token_loss += loss * tokens_in_optimizer_step
-            avg_train_loss = train_token_loss / train_tokens_seen
+            avg_train_loss = train_token_loss / (train_tokens_seen - initial_tokens_seen)
             progress.update(tokens_in_optimizer_step)
             progress.set_postfix(loss=f"{avg_train_loss:.4f}", lr=f"{learning_rate:.2e}")
 
