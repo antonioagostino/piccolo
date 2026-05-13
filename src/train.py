@@ -336,11 +336,17 @@ def resolve_device(requested_device: str) -> torch.device:
         ValueError: If ``"cuda"`` is requested but CUDA is not available.
     """
     if requested_device == "auto":
-        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
 
     device = torch.device(requested_device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested but is not available")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS was requested but is not available")
 
     return device
 
@@ -776,7 +782,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                         step=train_tokens_seen,
                     )
                     save_checkpoint(
-                        path=config.checkpoint_dir / "checkpoint_latest.pt",
+                        path=config.checkpoint_dir / "checkpoint_val_last.pt",
                         language_model=language_model,
                         optimizer=optimizer,
                         scaler=scaler,
@@ -825,7 +831,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             )
 
         save_checkpoint(
-            path=config.checkpoint_dir / "checkpoint_last.pt",
+            path=config.checkpoint_dir / "checkpoint_final.pt",
             language_model=language_model,
             optimizer=optimizer,
             scaler=scaler,

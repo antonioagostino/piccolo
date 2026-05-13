@@ -122,6 +122,8 @@ def get_supported_weights_precision(device: torch.device) -> torch.dtype:
         return torch.bfloat16
     if device.type == "cuda":
         return torch.float16
+    if device.type == "mps":
+        return torch.float16
     return torch.float32
 
 
