@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 from src.dataset import PreTrainingDataset, count_pre_training_tokens, load_text_from_parquet_file
 from src.tokenizer import TiktokenTokenizer, Tokenizer
+from src.utils.process_whatsapp import load_whatsapp_sessions
 
 
 class LengthTokenizer(Tokenizer):
@@ -48,6 +49,21 @@ def token_count_dataset_dir(tmp_path: Path) -> Path:
     path.parent.mkdir(parents=True)
     pd.DataFrame({"text": ["abc", "def", "ghi"]}).to_parquet(path, engine="auto", index=False)
     return root
+
+@pytest.fixture
+def conversational_dataset_file(tmp_path: Path) -> Path:
+    root = tmp_path / "conversational"
+    path = root / "friend.txt"
+    path.parent.mkdir(parents=True)
+    conv_file_text = "[24/05/22, 22:05:33] Lorenzo ‎I messaggi e le chiamate sono crittografati end-to-end. Solo le persone in questa chat possono leggerne, ascoltarne o condividerne il contenuto.\n"
+    conv_file_text += "[24/05/22, 22:05:33] Antonio: Ehi come stai?\n"
+    conv_file_text += "[24/05/22, 22:06:00] Lorenzo: Bene, grazie, tu?\n"
+    conv_file_text += "[24/05/22, 22:06:53] Antonio: Tutto bene, grazie!\n"
+    conv_file_text += "[24/05/22, 22:46:53] Antonio: Ti ricordi di quella cosa che ti ho chiesto?\n"
+    print(path)
+    with open(path, mode="w") as tmp_conv_file:
+        tmp_conv_file.write(conv_file_text)
+    return path
 
 
 def test_load_text_from_parquet_file(three_text_dataset_dir: Path):
@@ -104,3 +120,7 @@ def test_count_pre_training_tokens_matches_dataset_split(token_count_dataset_dir
 
     assert counts.train_tokens == 8
     assert counts.val_tokens == 4
+
+def test_load_whatsapp_session(conversational_dataset_file: Path):
+    whatsapp_sessions: list[str] = load_whatsapp_sessions(conversational_dataset_file, 30)
+    assert len(whatsapp_sessions) == 2
