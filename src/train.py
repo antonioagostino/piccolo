@@ -55,6 +55,7 @@ class TrainingConfig:
     val_max_iterations: int | None
     n_epochs: int
     checkpoint_dir: Path
+    init_from: Path | None
     resume_from: Path | None
     wandb: WandbConfig
 
@@ -192,6 +193,7 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "val_max_iterations": config.val_max_iterations,
         "n_epochs": config.n_epochs,
         "checkpoint_dir": str(config.checkpoint_dir),
+        "init_from": str(config.init_from) if config.init_from is not None else None,
         "resume_from": str(config.resume_from) if config.resume_from is not None else None,
         "wandb": {
             "enabled": config.wandb.enabled,
@@ -270,6 +272,11 @@ def load_training_config(config_path: Path) -> TrainingConfig:
         ),
         n_epochs=int(training.get("n_epochs", 1)),
         checkpoint_dir=Path(training.get("checkpoint_dir", "./checkpoints")),
+        init_from=(
+            Path(training["init_from"])
+            if training.get("init_from") is not None
+            else None
+        ),
         resume_from=(
             Path(training["resume_from"])
             if training.get("resume_from") is not None
@@ -322,8 +329,12 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("gradient_accumulation_steps must be at least 1")
     if config.n_epochs < 1:
         raise ValueError("n_epochs must be at least 1")
+    if config.init_from is not None and not config.init_from.is_file():
+        raise ValueError(f"init_from path does not exist: {config.init_from}")
     if config.resume_from is not None and not config.resume_from.is_file():
         raise ValueError(f"resume_from path does not exist: {config.resume_from}")
+    if config.init_from is not None and config.resume_from is not None:
+        raise ValueError("init_from and resume_from are mutually exclusive")
 
 
 def resolve_device(requested_device: str) -> torch.device:
@@ -677,6 +688,17 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
     best_val_loss = float("inf")
     wandb_run_id: str | None = None
 
+    if config.init_from is not None:
+        # Load only the model weights from a prior checkpoint (e.g. a
+        # pre-trained model used as the starting point for SFT).
+        # Optimizer state, step counters, and W&B run ID are intentionally
+        # NOT restored so the new training phase starts from a clean slate.
+        print(f"Initialising weights from {config.init_from} …")
+        checkpoint = torch.load(config.init_from, map_location="cpu", weights_only=True)
+        model = getattr(language_model, "_orig_mod", language_model)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        del checkpoint
+
     if config.resume_from is not None:
         optimizer_steps, train_tokens_seen, best_val_loss, _, wandb_run_id = load_checkpoint(
             config.resume_from, language_model, optimizer, scaler
@@ -977,6 +999,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to the YAML training config.",
     )
     parser.add_argument(
+        "--init-from",
+        type=Path,
+        default=None,
+        help="Path to a checkpoint whose model weights initialise this run "
+             "(optimizer state and step counters are reset — use for SFT).",
+    )
+    parser.add_argument(
         "--resume-from",
         type=Path,
         default=None,
@@ -994,6 +1023,8 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     config = load_training_config(args.config)
+    if args.init_from is not None:
+        config = dataclasses.replace(config, init_from=args.init_from)
     if args.resume_from is not None:
         config = dataclasses.replace(config, resume_from=args.resume_from)
     train(config, wandb_resume_id=args.wandb_resume_id)
