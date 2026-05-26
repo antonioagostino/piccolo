@@ -13,7 +13,7 @@ import torch
 import yaml
 from tqdm.auto import tqdm  # type: ignore[import-untyped]
 
-from src.dataset import TokenizedDataset
+from src.dataset import FinetuneDataset, TokenizedDataset
 from src.tokenizer import TiktokenTokenizer
 from src.transformer import (
     LanguageModel,
@@ -53,6 +53,7 @@ class TrainingConfig:
     log_every_tokens: int
     val_every_iterations: int
     val_max_iterations: int | None
+    n_epochs: int
     checkpoint_dir: Path
     resume_from: Path | None
     wandb: WandbConfig
@@ -189,6 +190,7 @@ def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
         "log_every_tokens": config.log_every_tokens,
         "val_every_iterations": config.val_every_iterations,
         "val_max_iterations": config.val_max_iterations,
+        "n_epochs": config.n_epochs,
         "checkpoint_dir": str(config.checkpoint_dir),
         "resume_from": str(config.resume_from) if config.resume_from is not None else None,
         "wandb": {
@@ -266,6 +268,7 @@ def load_training_config(config_path: Path) -> TrainingConfig:
             if training.get("val_max_iterations") is None
             else int(training["val_max_iterations"])
         ),
+        n_epochs=int(training.get("n_epochs", 1)),
         checkpoint_dir=Path(training.get("checkpoint_dir", "./checkpoints")),
         resume_from=(
             Path(training["resume_from"])
@@ -317,6 +320,8 @@ def validate_config(config: TrainingConfig) -> None:
         raise ValueError("val_max_iterations must be greater than 0 when configured")
     if config.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
+    if config.n_epochs < 1:
+        raise ValueError("n_epochs must be at least 1")
     if config.resume_from is not None and not config.resume_from.is_file():
         raise ValueError(f"resume_from path does not exist: {config.resume_from}")
 
@@ -364,7 +369,11 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_learning_rate(config: TrainingConfig, iteration: int) -> float:
+def get_learning_rate(
+    config: TrainingConfig,
+    iteration: int,
+    max_iterations: int | None = None,
+) -> float:
     """
     Compute the learning rate for a given training iteration.
 
@@ -376,6 +385,11 @@ def get_learning_rate(config: TrainingConfig, iteration: int) -> float:
         config (TrainingConfig): Training configuration holding the LR
             schedule parameters.
         iteration (int): Current training step (1-indexed).
+        max_iterations (int | None): Override for the total number of
+            training steps used to compute the cosine decay horizon.
+            When None, falls back to ``config.max_iterations``.  Pass
+            ``effective_max_iterations`` here when training with epochs
+            so the LR decays over the full multi-epoch span.
 
     Returns:
         float: The learning rate to use at this iteration.
@@ -389,10 +403,11 @@ def get_learning_rate(config: TrainingConfig, iteration: int) -> float:
     if config.lr_warmup_iterations > 0 and iteration <= config.lr_warmup_iterations:
         return config.learning_rate * iteration / config.lr_warmup_iterations
 
-    if config.max_iterations is None:
+    effective_max = max_iterations if max_iterations is not None else config.max_iterations
+    if effective_max is None:
         return config.learning_rate
 
-    decay_iterations = config.max_iterations - config.lr_warmup_iterations
+    decay_iterations = effective_max - config.lr_warmup_iterations
     decay_iteration = max(iteration - config.lr_warmup_iterations - 1, 0)
     decay_progress = min(decay_iteration / decay_iterations, 1.0)
     cosine_multiplier = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
@@ -541,7 +556,7 @@ def save_checkpoint(
 
 def validate(
     language_model: torch.nn.Module,
-    dataset: TokenizedDataset,
+    dataset: TokenizedDataset | FinetuneDataset,
     device: torch.device,
     amp_dtype: torch.dtype,
     use_amp: bool,
@@ -667,7 +682,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             config.resume_from, language_model, optimizer, scaler
         )
         next_log_tokens = (train_tokens_seen // config.log_every_tokens + 1) * config.log_every_tokens
-        set_optimizer_learning_rate(optimizer, get_learning_rate(config, optimizer_steps))
+        # LR is restored after effective_max_iterations is computed below.
 
     # Track loss/tokens from this run's start so avg_loss is always meaningful,
     # even when resuming from a checkpoint with a large initial train_tokens_seen.
@@ -679,24 +694,95 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
     logger = build_logger(config, model_config, resume_run_id=wandb_resume_id or wandb_run_id)
 
     try:
-        dataset = TokenizedDataset(
-            data_dir=data_dir,
-            sequence_length=model_config.sequence_length,
-            batch_size=config.batch_size,
-        )
+        # ── Dataset auto-detection ───────────────────────────────────────────
+        # Finetune datasets (produced by tokenize_finetune) carry per-sample
+        # offset index files.  Pre-training datasets (produced by
+        # tokenize_dataset) are flat binary streams without offset files.
+        is_finetune = (data_dir / "train_offsets.npy").exists()
+
+        if is_finetune:
+            train_dataset: TokenizedDataset | FinetuneDataset = FinetuneDataset(
+                data_dir=data_dir,
+                sequence_length=model_config.sequence_length,
+                batch_size=config.batch_size,
+                pad_token_id=tokenizer.get_end_token(),
+                split="train",
+                seed=config.seed,
+            )
+            val_dataset: TokenizedDataset | FinetuneDataset = FinetuneDataset(
+                data_dir=data_dir,
+                sequence_length=model_config.sequence_length,
+                batch_size=config.batch_size,
+                pad_token_id=tokenizer.get_end_token(),
+                split="val",
+                seed=config.seed,
+            )
+            assert isinstance(train_dataset, FinetuneDataset)
+            n_optimizer_steps_per_epoch = max(
+                train_dataset.n_samples // (config.batch_size * config.gradient_accumulation_steps),
+                1,
+            )
+            computed_max = config.n_epochs * n_optimizer_steps_per_epoch
+            effective_max_iterations: int | None = (
+                min(config.max_iterations, computed_max)
+                if config.max_iterations is not None
+                else computed_max
+            )
+        else:
+            _tok_dataset = TokenizedDataset(
+                data_dir=data_dir,
+                sequence_length=model_config.sequence_length,
+                batch_size=config.batch_size,
+            )
+            if config.resume_from is not None:
+                # Restore position within the current epoch for seamless resume.
+                _tok_dataset._offset["train"] = train_tokens_seen
+            train_dataset = _tok_dataset
+            val_dataset = _tok_dataset
+            if config.max_iterations is not None:
+                effective_max_iterations = config.max_iterations
+            elif config.n_epochs > 1:
+                n_train_tokens = len(_tok_dataset._mmap["train"])
+                tokens_per_step = (
+                    config.batch_size
+                    * model_config.sequence_length
+                    * config.gradient_accumulation_steps
+                )
+                n_optimizer_steps_per_epoch = max(n_train_tokens // tokens_per_step, 1)
+                effective_max_iterations = config.n_epochs * n_optimizer_steps_per_epoch
+            else:
+                effective_max_iterations = None
+
+        # Now that effective_max_iterations is known, restore LR for resumed runs.
         if config.resume_from is not None:
-            dataset._offset["train"] = train_tokens_seen
+            set_optimizer_learning_rate(
+                optimizer,
+                get_learning_rate(config, optimizer_steps, effective_max_iterations),
+            )
+
+        # ── Helpers ──────────────────────────────────────────────────────────
+        def _get_train_batch() -> tuple[torch.Tensor, torch.Tensor]:
+            if is_finetune:
+                return train_dataset.get_batch()  # type: ignore[union-attr]
+            return train_dataset.get_sequential_batch("train")  # type: ignore[union-attr]
+
+        def _reset_epoch(epoch: int) -> None:
+            if is_finetune:
+                # Use a per-epoch seed derived from the base seed so each epoch
+                # sees a different sample order.
+                train_dataset.reset_epoch(seed=config.seed + epoch)  # type: ignore[union-attr]
+            else:
+                train_dataset.reset_split("train")  # type: ignore[union-attr]
 
         def _run_validation() -> float | None:
             result = validate(
                 language_model=language_model,
-                dataset=dataset,
+                dataset=val_dataset,
                 device=device,
                 amp_dtype=amp_dtype,
                 use_amp=use_amp,
                 max_iterations=config.val_max_iterations,
             )
-
             language_model.train()
             return result
 
@@ -707,104 +793,139 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             initial=train_tokens_seen,
         )
 
-        while True:
-            if config.max_iterations is not None and optimizer_steps >= config.max_iterations:
-                break
-
-            optimizer.zero_grad(set_to_none=True)
-            accumulated_loss = 0.0
-            tokens_in_optimizer_step = 0
-
-            for _ in range(config.gradient_accumulation_steps):
-                try:
-                    inputs, targets = dataset.get_sequential_batch("train")
-                except StopIteration:
-                    break
-                tokens_in_micro_batch = inputs.numel()
-                micro_loss = forward_backward_micro_step(
-                    language_model=language_model,
-                    scaler=scaler,
-                    inputs=inputs,
-                    targets=targets,
-                    device=device,
-                    amp_dtype=amp_dtype,
-                    use_amp=use_amp,
-                    loss_scale=1.0 / config.gradient_accumulation_steps,
-                )
-                accumulated_loss += micro_loss
-                tokens_in_optimizer_step += tokens_in_micro_batch
-
-            if tokens_in_optimizer_step == 0:
-                break
-
-            optimizer_steps += 1
-            learning_rate = get_learning_rate(config, optimizer_steps)
-            set_optimizer_learning_rate(optimizer, learning_rate)
-            optimizer_step(
-                language_model=language_model,
-                optimizer=optimizer,
-                scaler=scaler,
-                max_grad_norm=config.max_grad_norm,
+        # ── Epoch loop ───────────────────────────────────────────────────────
+        for epoch in range(1, config.n_epochs + 1):
+            # On a resumed pre-training run the data offset is already set
+            # above; skip the reset so we continue from where we left off.
+            # For all other cases (epoch > 1, or finetune), do the reset.
+            skip_reset = (
+                config.resume_from is not None
+                and epoch == 1
+                and not is_finetune
             )
+            if not skip_reset:
+                _reset_epoch(epoch)
 
-            loss = accumulated_loss / config.gradient_accumulation_steps
-            train_tokens_seen += tokens_in_optimizer_step
-            train_token_loss += loss * tokens_in_optimizer_step
-            avg_train_loss = train_token_loss / (train_tokens_seen - initial_tokens_seen)
-            ema_loss = loss if ema_loss is None else ema_alpha * ema_loss + (1 - ema_alpha) * loss
-            progress.update(tokens_in_optimizer_step)
-            progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
+            while True:
+                if (
+                    effective_max_iterations is not None
+                    and optimizer_steps >= effective_max_iterations
+                ):
+                    break
 
-            if train_tokens_seen >= next_log_tokens:
-                logger.log(
-                    {
-                        "train/loss": loss,
-                        "train/loss_ema": ema_loss,
-                        "train/avg_loss": avg_train_loss,
-                        "train/tokens_seen": train_tokens_seen,
-                        "train/optimizer_steps": optimizer_steps,
-                        "train/learning_rate": learning_rate,
-                    },
-                    step=train_tokens_seen,
-                )
-                while next_log_tokens <= train_tokens_seen:
-                    next_log_tokens += config.log_every_tokens
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_loss = 0.0
+                tokens_in_optimizer_step = 0
+                epoch_ended = False
 
-            if optimizer_steps % config.val_every_iterations == 0:
-                step_val_loss = _run_validation()
-                if step_val_loss is not None:
-                    logger.log(
-                        {
-                            "val/loss": step_val_loss,
-                            "train/tokens_seen": train_tokens_seen,
-                            "train/optimizer_steps": optimizer_steps,
-                        },
-                        step=train_tokens_seen,
+                for _ in range(config.gradient_accumulation_steps):
+                    try:
+                        inputs, targets = _get_train_batch()
+                    except StopIteration:
+                        epoch_ended = True
+                        break
+                    tokens_in_micro_batch = inputs.numel()
+                    micro_loss = forward_backward_micro_step(
+                        language_model=language_model,
+                        scaler=scaler,
+                        inputs=inputs,
+                        targets=targets,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                        use_amp=use_amp,
+                        loss_scale=1.0 / config.gradient_accumulation_steps,
                     )
-                    save_checkpoint(
-                        path=config.checkpoint_dir / "checkpoint_val_last.pt",
+                    accumulated_loss += micro_loss
+                    tokens_in_optimizer_step += tokens_in_micro_batch
+
+                # Flush any partial accumulation collected before epoch end.
+                if tokens_in_optimizer_step > 0:
+                    optimizer_steps += 1
+                    learning_rate = get_learning_rate(
+                        config, optimizer_steps, effective_max_iterations
+                    )
+                    set_optimizer_learning_rate(optimizer, learning_rate)
+                    optimizer_step(
                         language_model=language_model,
                         optimizer=optimizer,
                         scaler=scaler,
-                        optimizer_steps=optimizer_steps,
-                        train_tokens_seen=train_tokens_seen,
-                        train_token_loss=train_token_loss,
-                        val_loss=step_val_loss,
-                        wandb_run_id=logger.run_id,
+                        max_grad_norm=config.max_grad_norm,
                     )
-                    if step_val_loss < best_val_loss:
-                        best_val_loss = step_val_loss
-                        save_checkpoint(
-                            path=config.checkpoint_dir / "checkpoint_best.pt",
-                            language_model=language_model,
-                            optimizer=optimizer,
-                            scaler=scaler,
-                            optimizer_steps=optimizer_steps,
-                            train_tokens_seen=train_tokens_seen,
-                            train_token_loss=train_token_loss,
-                            val_loss=step_val_loss,
-                            wandb_run_id=logger.run_id,
+
+                    loss = accumulated_loss / config.gradient_accumulation_steps
+                    train_tokens_seen += tokens_in_optimizer_step
+                    train_token_loss += loss * tokens_in_optimizer_step
+                    avg_train_loss = train_token_loss / (train_tokens_seen - initial_tokens_seen)
+                    ema_loss = (
+                        loss if ema_loss is None
+                        else ema_alpha * ema_loss + (1 - ema_alpha) * loss
+                    )
+                    progress.update(tokens_in_optimizer_step)
+                    progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
+
+                    if train_tokens_seen >= next_log_tokens:
+                        logger.log(
+                            {
+                                "train/loss": loss,
+                                "train/loss_ema": ema_loss,
+                                "train/avg_loss": avg_train_loss,
+                                "train/tokens_seen": train_tokens_seen,
+                                "train/optimizer_steps": optimizer_steps,
+                                "train/learning_rate": learning_rate,
+                            },
+                            step=train_tokens_seen,
                         )
+                        while next_log_tokens <= train_tokens_seen:
+                            next_log_tokens += config.log_every_tokens
+
+                    if optimizer_steps % config.val_every_iterations == 0:
+                        step_val_loss = _run_validation()
+                        if step_val_loss is not None:
+                            logger.log(
+                                {
+                                    "val/loss": step_val_loss,
+                                    "train/tokens_seen": train_tokens_seen,
+                                    "train/optimizer_steps": optimizer_steps,
+                                },
+                                step=train_tokens_seen,
+                            )
+                            save_checkpoint(
+                                path=config.checkpoint_dir / "checkpoint_val_last.pt",
+                                language_model=language_model,
+                                optimizer=optimizer,
+                                scaler=scaler,
+                                optimizer_steps=optimizer_steps,
+                                train_tokens_seen=train_tokens_seen,
+                                train_token_loss=train_token_loss,
+                                val_loss=step_val_loss,
+                                wandb_run_id=logger.run_id,
+                            )
+                            if step_val_loss < best_val_loss:
+                                best_val_loss = step_val_loss
+                                save_checkpoint(
+                                    path=config.checkpoint_dir / "checkpoint_best.pt",
+                                    language_model=language_model,
+                                    optimizer=optimizer,
+                                    scaler=scaler,
+                                    optimizer_steps=optimizer_steps,
+                                    train_tokens_seen=train_tokens_seen,
+                                    train_token_loss=train_token_loss,
+                                    val_loss=step_val_loss,
+                                    wandb_run_id=logger.run_id,
+                                )
+
+                if epoch_ended:
+                    # Log epoch completion and break out of the while loop so
+                    # the outer for loop can advance to the next epoch.
+                    if config.n_epochs > 1:
+                        logger.log(
+                            {
+                                "train/epoch": epoch,
+                                "train/tokens_seen": train_tokens_seen,
+                            },
+                            step=train_tokens_seen,
+                        )
+                    break
 
         progress.close()
 
@@ -814,7 +935,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                     "train/final_loss": train_token_loss / train_tokens_seen,
                     "train/tokens_seen": train_tokens_seen,
                     "train/optimizer_steps": optimizer_steps,
-                    "train/learning_rate": get_learning_rate(config, optimizer_steps),
+                    "train/learning_rate": get_learning_rate(config, optimizer_steps, effective_max_iterations),
                 },
                 step=train_tokens_seen,
             )

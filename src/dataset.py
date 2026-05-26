@@ -408,6 +408,10 @@ class TokenizedDataset:
         """Rewind the read cursor for the given split to the beginning."""
         self._offset[split] = 0
 
+    def reset_epoch(self) -> None:
+        """Rewind the training cursor to start a new epoch (no reshuffling needed)."""
+        self.reset_split("train")
+
     def get_sequential_batch(self, split: str) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Return the next non-overlapping batch from the given split.
@@ -514,6 +518,35 @@ class FinetuneDataset:
         if seed is not None:
             self._order = np.random.default_rng(seed).permutation(self._n_samples)
         self._cursor = 0
+
+    def reset_epoch(self, seed: int | None = None) -> None:
+        """
+        Reshuffle and rewind for a new epoch.
+
+        Pass a seed that varies per epoch to guarantee a different sample
+        order each pass:
+            dataset.reset_epoch(seed=base_seed + epoch)
+        """
+        self.reset(seed=seed)
+
+    def reset_split(self, _split: str) -> None:
+        """
+        Shim for TokenizedDataset API compatibility (used by validate()).
+
+        Rewinds the read cursor without reshuffling so validation is
+        deterministic. The split argument is ignored — this FinetuneDataset
+        instance is already bound to one split at construction time.
+        """
+        self._cursor = 0
+
+    def get_sequential_batch(self, _split: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Shim for TokenizedDataset API compatibility (used by validate()).
+
+        Delegates to get_batch(); the split argument is ignored because
+        this FinetuneDataset instance is already bound to one split.
+        """
+        return self.get_batch()
 
     def get_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
