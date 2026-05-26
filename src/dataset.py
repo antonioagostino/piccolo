@@ -408,8 +408,13 @@ class TokenizedDataset:
         """Rewind the read cursor for the given split to the beginning."""
         self._offset[split] = 0
 
-    def reset_epoch(self) -> None:
-        """Rewind the training cursor to start a new epoch (no reshuffling needed)."""
+    def reset_epoch(self, _seed: int | None = None) -> None:
+        """Rewind the training cursor to start a new epoch.
+
+        The _seed parameter is accepted for API compatibility with
+        FinetuneDataset but is ignored — TokenizedDataset reads tokens in a
+        fixed sequential order and has nothing to reshuffle.
+        """
         self.reset_split("train")
 
     def get_sequential_batch(self, split: str) -> tuple[torch.Tensor, torch.Tensor]:

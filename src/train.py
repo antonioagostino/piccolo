@@ -761,11 +761,6 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             )
 
         # ── Helpers ──────────────────────────────────────────────────────────
-        def _get_train_batch() -> tuple[torch.Tensor, torch.Tensor]:
-            if is_finetune:
-                return train_dataset.get_batch()  # type: ignore[union-attr]
-            return train_dataset.get_sequential_batch("train")  # type: ignore[union-attr]
-
         def _reset_epoch(epoch: int) -> None:
             if is_finetune:
                 # Use a per-epoch seed derived from the base seed so each epoch
@@ -820,7 +815,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
 
                 for _ in range(config.gradient_accumulation_steps):
                     try:
-                        inputs, targets = _get_train_batch()
+                        inputs, targets = train_dataset.get_sequential_batch("train")  # type: ignore[union-attr]
                     except StopIteration:
                         epoch_ended = True
                         break
