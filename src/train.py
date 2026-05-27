@@ -824,10 +824,12 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                 _reset_epoch(epoch)
 
             while True:
-                if (
-                    effective_max_iterations is not None
-                    and optimizer_steps >= effective_max_iterations
-                ):
+                # Honour an explicit max_iterations hard cap if set.
+                # For epoch-based training the for loop above is the natural
+                # stopping mechanism; effective_max_iterations is used only
+                # for LR scheduling and must not be the stopping criterion
+                # (it is a floor-rounded estimate and can be off by n_epochs).
+                if config.max_iterations is not None and optimizer_steps >= config.max_iterations:
                     break
 
                 optimizer.zero_grad(set_to_none=True)
