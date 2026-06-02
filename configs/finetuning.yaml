@@ -1,0 +1,28 @@
+training:
+  data_dir: ./data/finetune
+  model_config: ./configs/model.yaml
+  tokenizer_encoding: cl100k_base
+  init_from: null
+  resume_from: null
+  batch_size: 18
+  gradient_accumulation_steps: 1
+  learning_rate: 0.00002
+  min_learning_rate: 0.0
+  lr_warmup_iterations: 0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  n_epochs: 2
+  max_iterations: null
+  device: auto
+  compile_model: true
+  gradient_checkpointing: false
+  seed: 42
+  log_every_tokens: 2048
+  val_every_iterations: 20
+  val_max_iterations: null
+  checkpoint_dir: ./checkpoints/finetune
+  wandb:
+    enabled: true
+    project: friendsbot
+    run_name: friendsbot-sft-run-1
+    mode: online
