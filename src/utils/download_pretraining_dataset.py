@@ -13,7 +13,7 @@ def download_cultura_x(files_to_download: list[str],
                        hf_token: str) -> None:
     """Download the CulturaX datset's files from the HuggingFace Hub"""
 
-    dataset_output_dir = Path(output_dir / "CulturaX")
+    dataset_output_dir = Path(output_dir) / "CulturaX"
     dataset_output_dir.mkdir(parents=True, exist_ok=True)
 
     for dataset_file in tqdm(files_to_download, desc=f"Downloading CulturaX", unit="file"):
