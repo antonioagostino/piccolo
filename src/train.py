@@ -717,9 +717,9 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
 
     try:
         # ── Dataset auto-detection ───────────────────────────────────────────
-        # Finetune datasets (produced by tokenize_finetune) carry per-sample
-        # offset index files.  Pre-training datasets (produced by
-        # tokenize_dataset) are flat binary streams without offset files.
+        # Finetune datasets carry per-sample offset index files alongside the
+        # flat token binary.  Pre-training datasets are flat binary streams
+        # with no offset files.
         is_finetune = (data_dir / "train_offsets.npy").exists()
 
         if is_finetune:

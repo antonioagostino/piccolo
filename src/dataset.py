@@ -446,14 +446,18 @@ class TokenizedDataset:
 
 class FinetuneDataset:
     """
-    Finetuning dataset backed by variable-length tokenized session files.
+    Finetuning dataset backed by variable-length tokenized sample files.
 
-    Reads {split}.bin and {split}_offsets.npy produced by
-    src.utils.tokenize_finetune.  Each sample is one tokenized conversation
-    chunk.  Samples shorter than sequence_length are right-padded with
-    pad_token_id.  Because the causal mask prevents real tokens from attending
-    to later positions, padding at the tail never influences real-token
-    representations, so no loss mask is needed.
+    Expects the following files in data_dir:
+        {split}.bin          flat uint32 array of token ids, all samples concatenated
+        {split}_offsets.npy  int64 array of shape (n_samples + 1,) marking
+                             where each sample starts in the .bin file
+        metadata.json        optional, used for validation at construction time
+
+    Samples shorter than sequence_length are right-padded with pad_token_id.
+    Because the causal mask prevents real tokens from attending to later
+    positions, padding at the tail never influences real-token representations,
+    so no loss mask is needed.
 
     Shuffling is done at the sample level: sample indices are permuted once at
     construction time (and again on each reset() call).  This ensures every
@@ -473,13 +477,12 @@ class FinetuneDataset:
     ) -> None:
         """
         Args:
-            data_dir: Directory containing the binary files from tokenize_finetune.
+            data_dir: Directory containing {split}.bin and {split}_offsets.npy.
             sequence_length: Model context length; samples are padded/truncated
                 to this length.
             batch_size: Number of samples per batch.
             pad_token_id: Token ID used to fill positions beyond the real sample
-                length.  The loss mask zeroes out these positions so padding
-                never contributes to the gradient.
+                length.
             split: ``"train"`` or ``"val"``.
             seed: RNG seed for the initial sample-level shuffle.
         """
@@ -488,7 +491,7 @@ class FinetuneDataset:
         if not meta_path.exists():
             raise FileNotFoundError(
                 f"metadata.json not found in {data_dir}. "
-                "Run `python -m src.utils.tokenize_finetune` first."
+                "Make sure the tokenization script has been run first."
             )
 
         assert split in ("train", "val"), "split must be 'train' or 'val'"
