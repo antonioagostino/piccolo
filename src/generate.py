@@ -1,5 +1,5 @@
 """
-Autoregressive inference for the friendsbot language model.
+Autoregressive inference for the piccolo language model.
 
 Loads a checkpoint, reads a prompt from stdin, and streams generated tokens
 to stdout one by one.  Generation stops when the end-of-text token is
@@ -217,7 +217,7 @@ def main() -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Autoregressive inference for the friendsbot language model."
+        description="Autoregressive inference for the piccolo language model."
     )
     parser.add_argument(
         "--checkpoint", type=Path, required=True,

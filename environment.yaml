@@ -1,4 +1,4 @@
-name: friendsbot
+name: piccolo
 channels:
   - defaults
 dependencies:

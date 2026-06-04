@@ -284,7 +284,7 @@ def load_training_config(config_path: Path) -> TrainingConfig:
         ),
         wandb=WandbConfig(
             enabled=bool(wandb_config.get("enabled", True)),
-            project=str(wandb_config.get("project", "friendsbot")),
+            project=str(wandb_config.get("project", "piccolo")),
             run_name=wandb_config.get("run_name"),
             mode=str(wandb_config.get("mode", "online")),
         ),
@@ -993,7 +993,7 @@ def parse_args() -> argparse.Namespace:
         argparse.Namespace: Parsed arguments with a ``config`` field holding
             the path to the YAML training configuration.
     """
-    parser = argparse.ArgumentParser(description="Train the friendsbot language model.")
+    parser = argparse.ArgumentParser(description="Train the piccolo language model.")
     parser.add_argument(
         "--config",
         type=Path,

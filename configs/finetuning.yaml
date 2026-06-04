@@ -23,6 +23,6 @@ training:
   checkpoint_dir: ./checkpoints/finetune
   wandb:
     enabled: true
-    project: friendsbot
-    run_name: friendsbot-sft-run-1
+    project: piccolo
+    run_name: piccolo-sft-run-1
     mode: online
