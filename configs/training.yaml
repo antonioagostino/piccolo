@@ -1,5 +1,5 @@
 training:
-  data_dir: ./data/tokenized
+  data_dir: ./data/raw_text_tokenized
   model_config: ./configs/model.yaml
   tokenizer_encoding: cl100k_base
   batch_size: 18

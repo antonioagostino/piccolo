@@ -1,12 +1,10 @@
 import pytest
-from pathlib import Path
-
 import pandas as pd
+from pathlib import Path
 import torch
-
-from src.dataset import TokenizedPreTrainingDataset
-from src.tokenizer import TiktokenTokenizer
+import numpy as np
 from src.utils.tokenize_pretraining_dataset import tokenize_dataset
+from src.tokenizer import TiktokenTokenizer
 
 @pytest.fixture
 def three_text_dataset_dir(tmp_path: Path) -> Path:
@@ -22,7 +20,7 @@ def three_text_dataset_dir(tmp_path: Path) -> Path:
     }).to_parquet(path, engine="auto", index=False)
     return root
 
-def test_pretraining_dataset(three_text_dataset_dir: Path):
+def test_tokenize_pretraining_dataset(three_text_dataset_dir: Path):
     tokenizer_encoding = "cl100k_base"
     tokenizer = TiktokenTokenizer(tokenizer_encoding)
     tokenized_data_dir = three_text_dataset_dir.parent / "raw_text_tokenized"
@@ -31,13 +29,12 @@ def test_pretraining_dataset(three_text_dataset_dir: Path):
                      tokenizer_encoding,
                      0.9,
                      42)
-    pretraining_dataset = TokenizedPreTrainingDataset(
-        tokenized_data_dir,
-        6,
-        1
-    )
+    train_tokenized_text = np.memmap(tokenized_data_dir / "train.bin", dtype=np.uint32, mode="r")
+    val_tokenized_text = np.memmap(tokenized_data_dir / "val.bin", dtype=np.uint32, mode="r")
+    train = np.array(train_tokenized_text, dtype=np.int64)
+    val = np.array(val_tokenized_text, dtype=np.int64)
+    expected_raw_train_text = "This is the second text.<|endoftext|>This is the first text.<|endoftext|>"
+    expected_raw_val_text = "This is the third text.<|endoftext|>"
 
-    x, y = pretraining_dataset.get_sequential_batch("train")
-    assert torch.all(x[0][1:] == y[0][:-1])
-    x, y = pretraining_dataset.get_sequential_batch("val")
-    assert torch.all(x[0][1:] == y[0][:-1])
+    assert tokenizer.decode(train) == expected_raw_train_text
+    assert tokenizer.decode(val) == expected_raw_val_text
