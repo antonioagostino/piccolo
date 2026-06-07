@@ -7,8 +7,8 @@ import huggingface_hub
 
 def download_alpaca_gpt4_italian(hf_token: str,
                                  max_files: int,
-                                 seed: int,
-                                 output_dir: str) -> None:
+                                 output_dir: str,
+                                 rng: random.Random) -> None:
     """Download the Alpaca GPT4 Italian datset's files from the HuggingFace Hub"""
 
     repo_id = "FreedomIntelligence/alpaca-gpt4-italian"
@@ -28,9 +28,8 @@ def download_alpaca_gpt4_italian(hf_token: str,
         if Path(file).suffix in {".parquet", ".json", ".jsonl"}:
             filtered_repo_files.append(file)
 
-    random.seed(seed)
-    files_to_download: list[str] = random.sample(filtered_repo_files,
-                                                 max_files)
+    files_to_download: list[str] = rng.sample(filtered_repo_files,
+                                              max_files)
     
 
     dataset_output_dir = Path(output_dir) / "alpaca-gpt4-italian"
@@ -49,8 +48,8 @@ def download_alpaca_gpt4_italian(hf_token: str,
 
 def download_cultura_x(hf_token: str,
                        max_files: int,
-                       seed: int,
-                       output_dir: str) -> None:
+                       output_dir: str,
+                       rng: random.Random) -> None:
     """Download the CulturaX datset's files from the HuggingFace Hub"""
 
     repo_id = "uonlp/CulturaX"
@@ -70,9 +69,8 @@ def download_cultura_x(hf_token: str,
         if file.startswith("it") and Path(file).suffix == ".parquet":
             filtered_repo_files.append(file)
 
-    random.seed(seed)
-    files_to_download: list[str] = random.sample(filtered_repo_files,
-                                                 max_files)
+    files_to_download: list[str] = rng.sample(filtered_repo_files,
+                                              max_files)
     
     dataset_output_dir = Path(output_dir) / "CulturaX"
     dataset_output_dir.mkdir(parents=True, exist_ok=True)
@@ -129,16 +127,17 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    rng = random.Random(args.seed)
     if args.dataset_type == "pretraining":
         download_cultura_x(args.token,
                            args.max_files,
-                           args.seed,
-                           args.output_dir)
+                           args.output_dir,
+                           rng)
     elif args.dataset_type == "sft":
         download_alpaca_gpt4_italian(args.token,
                                      args.max_files,
-                                     args.seed,
-                                     args.output_dir)
+                                     args.output_dir,
+                                     rng)
     else:
         raise ValueError("Dataset type not supported!")
 
