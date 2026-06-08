@@ -3,8 +3,9 @@ import json
 from pathlib import Path
 
 import numpy as np
-import tiktoken
 from tqdm.auto import tqdm  # type: ignore[import-untyped]
+
+from src.tokenizer import TiktokenTokenizer
 
 def format_sample(conversations: list[dict]) -> str:
     """Transform a ShareGPT-style conversation as a plain-text string."""
@@ -19,11 +20,11 @@ def main() -> None:
     assert args.data_file.exists() and args.data_file.suffix == ".json", "Invalid dataset file. Alpaca GPT4 dataset's \
                                                                             is encoded as JSON file."
     data = json.loads(args.data_file.read_text(encoding="utf-8"))
-    enc = tiktoken.get_encoding(args.encoding)
+    tokenizer = TiktokenTokenizer(args.encoding)
     seqs_lengths = []
     for sample in tqdm(data, desc="Tokenising", unit=" samples"):
         text = format_sample(sample["conversations"])
-        seqs_lengths.append(len(enc.encode(text)))
+        seqs_lengths.append(len(tokenizer.encode(text)))
     
     seqs_lengths_arr = np.array(seqs_lengths, dtype=np.int64)
 

@@ -1,5 +1,5 @@
 training:
-  data_dir: ./data/finetune
+  data_dir: ./data/conversational_tokenized
   model_config: ./configs/model.yaml
   tokenizer_encoding: cl100k_base
   init_from: null
