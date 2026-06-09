@@ -84,7 +84,7 @@ class TokenizedFinetuneDataset:
             "train": np.load(data_dir / "train_offsets.npy"),
             "val": np.load(data_dir / "val_offsets.npy")
         }
-        self.n_samples: dict[str, np.ndarray] = {
+        self.n_samples: dict[str, int] = {
             "train": len(self._offsets["train"]) - 1,
             "val": len(self._offsets["val"]) - 1,
         }

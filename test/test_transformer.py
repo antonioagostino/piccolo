@@ -6,11 +6,10 @@ import torch
 from src.transformer import (
     GroupedQueryAttention,
     LanguageModel,
-    ModelConfig,
     RMSNorm,
     get_supported_weights_precision,
-    language_model_loss,
-    training_step,
+    forward_backward_micro_step,
+    optimizer_step
 )
 
 
@@ -29,15 +28,18 @@ def build_language_model(kv_cache=None):
     )
 
 
-def test_rms_norm_keeps_shape_and_dtype():
+def test_rms_norm():
     norm = RMSNorm(feature_size=8, device=torch.device("cpu"))
     x = torch.randn(2, 3, 8, dtype=torch.float32)
 
+    scale = 10.0
     y = norm(x)
+    y_scaled = norm(x * scale)
 
     assert y.shape == x.shape
     assert y.dtype == x.dtype
     assert torch.isfinite(y).all()
+    assert torch.allclose(y, y_scaled, atol=1e-5)
 
 
 def test_grouped_query_attention_preserves_embedding_shape():
@@ -80,8 +82,8 @@ def test_language_model_loss_returns_scalar():
     tokens = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
     targets = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
 
-    logits = model(tokens)
-    loss = language_model_loss(logits, targets)
+    
+    loss = model(tokens, targets)
 
     assert loss.shape == torch.Size([])
     assert torch.isfinite(loss)
@@ -97,15 +99,22 @@ def test_training_step_updates_model_parameters():
     targets = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
     initial_embedding = model.embedding_matrix.weight.detach().clone()
 
-    loss = training_step(
+    loss = forward_backward_micro_step(
         language_model=model,
-        optimizer=optimizer,
         scaler=scaler,
         inputs=tokens,
         targets=targets,
         device=device,
         amp_dtype=get_supported_weights_precision(device),
         use_amp=False,
+        loss_scale=1.0
+    )
+
+    optimizer_step(
+        language_model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        max_grad_norm=1.0,
     )
 
     assert loss > 0
@@ -131,30 +140,13 @@ def test_model_config_loads_from_yaml(tmp_path: Path):
         encoding="utf-8",
     )
 
-    config = ModelConfig.from_yaml(config_path)
+    model = LanguageModel.from_config(config_path,
+                                      {},
+                                      torch.device("cpu"))
 
-    assert config.vocab_size == 64
-    assert config.sequence_length == 16
-    assert config.resolved_ffn_hidden_dim == 96
-
-
-def test_language_model_can_be_built_from_config():
-    config = ModelConfig(
-        vocab_size=64,
-        sequence_length=16,
-        embedding_dim=32,
-        n_decoder_blocks=3,
-        n_heads=4,
-        n_kv_heads=2,
-        ffn_hidden_dim=96,
-        dropout_rate=0.15,
-    )
-
-    model = LanguageModel.from_config(config, kv_cache={}, device=torch.device("cpu"))
-
-    assert model.vocab_size == config.vocab_size
-    assert model.embedding_dim == config.embedding_dim
-    assert model.transformer_decoder.ffn_hidden_dim == config.ffn_hidden_dim
+    assert model.vocab_size == 64
+    assert model.embedding_dim == 32
+    assert model.sequence_length == 16
 
 
 def test_cached_autoregressive_step_matches_full_forward_last_token():
