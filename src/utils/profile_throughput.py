@@ -20,6 +20,7 @@ GPU_TFLOPS: dict[str, float] = {
     "RTX_4090":  330.0,
     "RTX_3090":  142.0,
     "V100_FP16":  14.0,
+    "MBPRO_M5": 4.1
 }
 
 def format_output(value: float) -> str:
@@ -65,12 +66,11 @@ def profile_throughput(
     for _ in range(n_warmup):
         language_model.zero_grad(set_to_none=True)
         try:
-            x, y = dataset.get_sequential_batch("train")
+            inputs, targets = dataset.get_sequential_batch("train")
         except StopIteration:
             dataset.reset_split("train")
-            x, y = dataset.get_sequential_batch("train")
+            inputs, targets = dataset.get_sequential_batch("train")
 
-        x, y = x.to(device), y.to(device)
         language_model.train()
         inputs, targets = inputs.to(device), targets.to(device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -87,12 +87,11 @@ def profile_throughput(
     for _ in range(n_batches):
         language_model.zero_grad(set_to_none=True)
         try:
-            x, y = dataset.get_sequential_batch("train")
+            inputs, targets = dataset.get_sequential_batch("train")
         except StopIteration:
             dataset.reset_split("train")
-            x, y = dataset.get_sequential_batch("train")
+            inputs, targets = dataset.get_sequential_batch("train")
 
-        x, y = x.to(device), y.to(device)
         language_model.train()
         inputs, targets = inputs.to(device), targets.to(device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
@@ -131,7 +130,7 @@ def profile_throughput(
     if mfu is not None:
         print(f"MFU: {mfu:.1f}%")
     print()
-    print(f"Time to train {format_output(target_tokens)} tokens : {hours:,.0f} h  ({hours / 24:.1f} days)")
+    print(f"Time to train {format_output(target_tokens)} tokens: {hours:,.0f} h ({hours / 24:.1f} days)")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
