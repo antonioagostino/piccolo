@@ -7,9 +7,7 @@ from src.transformer import (
     GroupedQueryAttention,
     LanguageModel,
     RMSNorm,
-    get_supported_weights_precision,
-    forward_backward_micro_step,
-    optimizer_step
+    get_supported_weights_precision
 )
 
 
@@ -95,29 +93,35 @@ def test_training_step_updates_model_parameters():
     model = build_language_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scaler = torch.amp.GradScaler(device.type, enabled=False)
-    tokens = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
+    inputs = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
     targets = torch.randint(0, model.vocab_size, (2, 6), dtype=torch.long)
     initial_embedding = model.embedding_matrix.weight.detach().clone()
+    MAX_GRAD_NORM = 1.0
 
-    loss = forward_backward_micro_step(
-        language_model=model,
-        scaler=scaler,
-        inputs=tokens,
-        targets=targets,
-        device=device,
-        amp_dtype=get_supported_weights_precision(device),
-        use_amp=False,
-        loss_scale=1.0
-    )
+    # COPIED from train.py
+    # --------------------
+    model.train()
+    inputs, targets = inputs.to(device), targets.to(device)
+    with torch.autocast(device_type=device.type, dtype=get_supported_weights_precision(device), enabled=False):
+        loss = model(inputs, targets=targets)
 
-    optimizer_step(
-        language_model=model,
-        optimizer=optimizer,
-        scaler=scaler,
-        max_grad_norm=1.0,
-    )
+    # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
+    # GradScaler is disabled and these calls are no-ops/pass-throughs.
+    
+    # Multiplies the loss by loss_scale before backpropagation; set
+    # loss_scale = 1 / gradient_accumulation_steps so gradients average
+    # correctly across an accumulation window.
+    loss_scale = 1 / 1.0
+    scaler.scale(loss * loss_scale).backward()
 
-    assert loss > 0
+    if MAX_GRAD_NORM is not None:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=MAX_GRAD_NORM)
+    scaler.step(optimizer)
+    scaler.update()
+    # ------------------- 
+
+    assert float(loss.detach().item()) > 0
     assert not torch.equal(initial_embedding, model.embedding_matrix.weight)
 
 

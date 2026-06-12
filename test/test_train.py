@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from src.train import get_learning_rate, load_training_config, train
-from src.utils.tokenize_dataset import tokenize_dataset
+from src.utils.tokenize_pretraining_dataset import tokenize_dataset
 
 
 def test_train_runs_from_yaml_config(tmp_path: Path):
@@ -20,7 +20,7 @@ def test_train_runs_from_yaml_config(tmp_path: Path):
         }
     ).to_parquet(dataset_file, engine="auto", index=False)
 
-    tokenized_dir = tmp_path / "data" / "tokenized"
+    tokenized_dir = tmp_path / "data" / "raw_text_tokenized"
     tokenize_dataset(
         data_dir=raw_dir,
         output_dir=tokenized_dir,
@@ -48,12 +48,17 @@ def test_train_runs_from_yaml_config(tmp_path: Path):
     )
 
     training_config_path = tmp_path / "training.yaml"
+    checkpoint_path = tmp_path / "checkpoints"
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
     training_config_path.write_text(
         "\n".join(
             [
                 "training:",
                 f"  data_dir: {tokenized_dir}",
                 f"  model_config: {model_config_path}",
+                "  tokenizer_encoding: cl100k_base",
+                "  gradient_checkpointing: false",
+                "  gradient_accumulation_steps: 1",
                 "  batch_size: 1",
                 "  learning_rate: 0.001",
                 "  min_learning_rate: 0.0001",
@@ -63,7 +68,11 @@ def test_train_runs_from_yaml_config(tmp_path: Path):
                 "  max_grad_norm: 1.0",
                 "  device: cpu",
                 "  compile_model: false",
+                "  val_every_iterations: 10",
                 "  seed: 0",
+                "  val_max_iterations: 5",
+                "  n_epochs: 1",
+                f"  checkpoint_dir: {checkpoint_path}",
                 "  log_every_tokens: 1",
                 "  wandb:",
                 "    enabled: false",
@@ -81,10 +90,26 @@ def test_learning_rate_uses_warmup_then_cosine_decay(tmp_path: Path):
         "\n".join(
             [
                 "training:",
+                f"  data_dir: {training_config_path}",
+                f"  model_config: {training_config_path}",
+                "  tokenizer_encoding: cl100k_base",
+                "  gradient_checkpointing: false",
+                "  gradient_accumulation_steps: 1",
+                "  batch_size: 1",
                 "  learning_rate: 1.0",
                 "  min_learning_rate: 0.1",
                 "  lr_warmup_iterations: 2",
                 "  max_iterations: 6",
+                "  weight_decay: 0.0",
+                "  max_grad_norm: 1.0",
+                "  device: cpu",
+                "  compile_model: false",
+                "  val_every_iterations: 10",
+                "  seed: 0",
+                "  val_max_iterations: 5",
+                "  n_epochs: 1",
+                f"  checkpoint_dir: {training_config_path}",
+                "  log_every_tokens: 1",
                 "  wandb:",
                 "    enabled: false",
             ]
@@ -93,11 +118,11 @@ def test_learning_rate_uses_warmup_then_cosine_decay(tmp_path: Path):
     )
     config = load_training_config(training_config_path)
 
-    assert get_learning_rate(config, 1) == pytest.approx(0.5)
-    assert get_learning_rate(config, 2) == pytest.approx(1.0)
-    assert get_learning_rate(config, 3) == pytest.approx(1.0)
-    assert get_learning_rate(config, 5) == pytest.approx(0.55)
-    assert get_learning_rate(config, 7) == pytest.approx(0.1)
+    assert get_learning_rate(1) == pytest.approx(0.5)
+    assert get_learning_rate(2) == pytest.approx(1.0)
+    assert get_learning_rate(3) == pytest.approx(1.0)
+    assert get_learning_rate(5) == pytest.approx(0.55)
+    assert get_learning_rate(7) == pytest.approx(0.1)
 
 
 def test_tokenized_dataset_token_counts_match_metadata(tmp_path: Path):
@@ -110,7 +135,7 @@ def test_tokenized_dataset_token_counts_match_metadata(tmp_path: Path):
         index=False,
     )
 
-    tokenized_dir = tmp_path / "tokenized"
+    tokenized_dir = tmp_path / "raw_text_tokenized"
     tokenize_dataset(
         data_dir=raw_dir,
         output_dir=tokenized_dir,

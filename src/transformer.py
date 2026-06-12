@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Union, cast
+from typing import Union
 import math
 import torch
 from torch import nn
@@ -41,61 +41,6 @@ def chunked_cross_entropy_loss(
         del chunk_logits
 
     return total_loss / (B * T)
-
-
-def forward_backward_micro_step(
-    language_model: nn.Module,
-    scaler: torch.amp.GradScaler,
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-    use_amp: bool,
-    loss_scale: float = 1.0,
-) -> float:
-    """Run one forward+backward pass for a single micro-batch."""
-    language_model.train()
-    inputs, targets = inputs.to(device), targets.to(device)
-    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-        loss = language_model(inputs, targets=targets)
-
-    # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
-    # GradScaler is disabled and these calls are no-ops/pass-throughs.
-    
-    # Multiplies the loss by loss_scale before backpropagation; set
-    # loss_scale = 1 / gradient_accumulation_steps so gradients average
-    # correctly across an accumulation window.
-    scaler.scale(loss * loss_scale).backward()
-    return float(loss.detach().item())
-
-
-def optimizer_step(
-    language_model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    max_grad_norm: float | None = 1.0,
-) -> None:
-    """
-    Unscale accumulated gradients, clip them, step the optimizer, and update the scaler.
-
-    Args:
-        language_model (nn.Module): The model whose parameters are updated.
-        optimizer (torch.optim.Optimizer): The optimizer.
-        scaler (torch.amp.GradScaler): Gradient scaler; updated after the step.
-        max_grad_norm (float | None): Maximum L2 gradient norm for clipping.
-            Pass None to disable clipping.
-    """
-    if max_grad_norm is not None:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=max_grad_norm)
-    scaler.step(optimizer)
-    scaler.update()
-
-def compile_language_model(language_model: nn.Module, enabled: bool) -> nn.Module:
-    """Optionally compile the model with torch.compile for faster execution."""
-    if enabled:
-        return cast(nn.Module, torch.compile(language_model))
-    return language_model
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalisation (no mean-subtraction)."""
@@ -394,6 +339,10 @@ class LanguageModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.sequence_length = sequence_length
         self.dropout_rate = dropout_rate
+        self.n_decoder_blocks = n_decoder_blocks
+        self.n_kv_heads = n_kv_heads
+        self.n_heads = n_heads
+        self.ffn_hidden_dim = ffn_hidden_dim
         self.embedding_matrix = nn.Embedding(vocab_size, embedding_dim)
         # N(0, 1/sqrt(D)) keeps logit variance ≈ 1 after the weight-tied LM
         # head, giving cross-entropy ≈ ln(vocab_size) at random init.
@@ -474,7 +423,7 @@ class LanguageModel(nn.Module):
             embedding_dim=model_selection["embedding_dim"],
             n_heads=model_selection["n_heads"],
             n_kv_heads=model_selection["n_kv_heads"],
-            ffn_hidden_dim=model_selection["resolved_ffn_hidden_dim"],
+            ffn_hidden_dim=model_selection["ffn_hidden_dim"],
             kv_cache=kv_cache,
             dropout_rate=model_selection["dropout_rate"],
             device=device,

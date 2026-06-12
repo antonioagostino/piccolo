@@ -25,7 +25,7 @@ class TokenizedPreTrainingDataset:
         """Rewind the read cursor for the given split to the beginning."""
         self._offset[split] = 0
 
-    def reset_epoch(self, _seed: int | None = None) -> None:
+    def reset_epoch(self, seed: int | None = None) -> None:
         """Rewind the training cursor to start a new epoch.
 
         The _seed parameter is accepted for API compatibility with
@@ -107,10 +107,9 @@ class TokenizedFinetuneDataset:
             self._orders[split] = np.random.default_rng(seed).permutation(self.n_samples[split])
         self._cursors[split] = 0
 
-    def reset_epoch(self, split: str, seed: int | None = None) -> None:
+    def reset_epoch(self, seed: int | None = None) -> None:
         """Reshuffle and rewind for a new epoch."""
-        assert split in ["train", "val"], "The split must be 'train' or 'val'"
-        self.reset(split=split, seed=seed)
+        self.reset(split="train", seed=seed)
 
     def reset_split(self, split: str) -> None:
         """Shim for TokenizedDataset API compatibility (used by validate())."""

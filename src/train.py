@@ -1,521 +1,266 @@
-from __future__ import annotations
-
 import argparse
-import dataclasses
 import math
 import random
-from dataclasses import dataclass
-from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, cast
 
 import torch
 import yaml
 from tqdm.auto import tqdm  # type: ignore[import-untyped]
+import wandb
 
-from src.dataset import FinetuneDataset, TokenizedDataset
+from src.dataset import TokenizedPreTrainingDataset, TokenizedFinetuneDataset
 from src.tokenizer import TiktokenTokenizer
 from src.transformer import (
     LanguageModel,
-    ModelConfig,
-    compile_language_model,
-    forward_backward_micro_step,
+    TransformerDecoder,
     get_supported_weights_precision,
-    optimizer_step,
 )
 
 
-@dataclass(frozen=True)
-class WandbConfig:
-    enabled: bool
-    project: str
-    run_name: str | None
-    mode: str
-
-
-@dataclass(frozen=True)
-class TrainingConfig:
-    data_dir: Path
-    model_config: Path
-    tokenizer_encoding: str
-    batch_size: int
-    learning_rate: float
-    min_learning_rate: float
-    lr_warmup_iterations: int
-    max_iterations: int | None
-    weight_decay: float
-    max_grad_norm: float | None
-    device: str
-    compile_model: bool
-    gradient_checkpointing: bool
-    gradient_accumulation_steps: int
-    seed: int
-    log_every_tokens: int
-    val_every_iterations: int
-    val_max_iterations: int | None
-    n_epochs: int
-    checkpoint_dir: Path
-    init_from: Path | None
-    resume_from: Path | None
-    wandb: WandbConfig
-
-
-class MetricsLogger:
-    """
-    No-op metrics logger used as a default when W&B is disabled.
-    """
-
-    @property
-    def run_id(self) -> str | None:
-        return None
-
-    def log(self, metrics: dict[str, float | int], step: int) -> None:
-        """
-        Record a dictionary of metrics at a given training step.
-
-        Args:
-            metrics (dict[str, float | int]): Mapping of metric names to
-                values.
-            step (int): Global step index (e.g. tokens seen).
-        """
-        pass
-
-    def finish(self) -> None:
-        """
-        Finalise the logging session and flush any pending data."""
-        pass
-
-
-class WandbMetricsLogger(MetricsLogger):
-    """
-    Metrics logger that streams training metrics to Weights & Biases.
-    """
-
-    def __init__(self,
-                 config: WandbConfig,
-                 training_config: TrainingConfig,
-                 model_config: ModelConfig,
-                 resume_run_id: str | None = None) -> None:
-        """
-        Initialise and start a W&B run.
-
-        Args:
-            config (WandbConfig): W&B project, run name, and mode settings.
-            training_config (TrainingConfig): Full training configuration
-                logged as run metadata.
-            model_config (ModelConfig): Model architecture configuration
-                logged as run metadata.
-            resume_run_id (str | None): W&B run ID to resume. When set,
-                metrics are appended to the existing run instead of starting
-                a new one.
-
-        Raises:
-            RuntimeError: If the ``wandb`` package is not installed.
-        """
-        try:
-            wandb = import_module("wandb")
-        except ImportError as exc:
-            raise RuntimeError(
-                "W&B logging is enabled, but wandb is not installed. "
-                "Install requirements.txt or set training.wandb.enabled=false."
-            ) from exc
-
-        self.__wandb: Any = wandb
-        self.__run: Any = self.__wandb.init(
-            project=config.project,
-            name=config.run_name,
-            mode=config.mode,
-            id=resume_run_id,
-            resume="must" if resume_run_id is not None else None,
-            config={
-                "training": config_to_dict(training_config),
-                "model": model_config.__dict__,
-            },
-        )
-        # When resuming, skip any step already present in the run so we never
-        # log backwards and trigger a step-ordering error from W&B.
-        self._skip_until_step: int = 0
-        if resume_run_id is not None and self.__run is not None:
-            self._skip_until_step = int(self.__run.summary.get("train/tokens_seen", 0))
-
-    @property
-    def run_id(self) -> str | None:
-        return self.__run.id if self.__run is not None else None
-
-    def log(self, metrics: dict[str, float | int], step: int) -> None:
-        """
-        Log a dictionary of metrics to the active W&B run.
-
-        Args:
-            metrics (dict[str, float | int]): Mapping of metric names to
-                values.
-            step (int): Global step index used as the x-axis in W&B charts.
-        """
-        if step <= self._skip_until_step:
-            return
-        self.__wandb.log(metrics, step=step)
-
-    def finish(self) -> None:
-        """
-        Finalise the W&B run, uploading any remaining queued data."""
-        if self.__run is not None:
-            self.__run.finish()
-
-
-def config_to_dict(config: TrainingConfig) -> dict[str, Any]:
-    """
-    Serialise a TrainingConfig to a plain dict suitable for JSON / W&B logging.
-
-    Args:
-        config (TrainingConfig): The training configuration to serialise.
-
-    Returns:
-        dict[str, Any]: Flat dictionary representation of the config.
-    """
+def training_config_to_dict() -> dict[str, Any]:
+    """Serialise global training config variables to a plain dict."""
     return {
-        "data_dir": str(config.data_dir),
-        "model_config": str(config.model_config),
-        "tokenizer_encoding": config.tokenizer_encoding,
-        "batch_size": config.batch_size,
-        "learning_rate": config.learning_rate,
-        "min_learning_rate": config.min_learning_rate,
-        "lr_warmup_iterations": config.lr_warmup_iterations,
-        "max_iterations": config.max_iterations,
-        "weight_decay": config.weight_decay,
-        "max_grad_norm": config.max_grad_norm,
-        "device": config.device,
-        "compile_model": config.compile_model,
-        "gradient_checkpointing": config.gradient_checkpointing,
-        "gradient_accumulation_steps": config.gradient_accumulation_steps,
-        "seed": config.seed,
-        "log_every_tokens": config.log_every_tokens,
-        "val_every_iterations": config.val_every_iterations,
-        "val_max_iterations": config.val_max_iterations,
-        "n_epochs": config.n_epochs,
-        "checkpoint_dir": str(config.checkpoint_dir),
-        "init_from": str(config.init_from) if config.init_from is not None else None,
-        "resume_from": str(config.resume_from) if config.resume_from is not None else None,
+        "data_dir": str(DATA_DIR),
+        "model_config": str(MODEL_CONFIG),
+        "tokenizer_encoding": TOKENIZER_ENCODING,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "min_learning_rate": MIN_LEARNING_RATE,
+        "lr_warmup_iterations": LR_WARMUP_ITERATIONS,
+        "max_iterations": MAX_ITERATIONS,
+        "weight_decay": WEIGHT_DECAY,
+        "max_grad_norm": MAX_GRAD_NORM,
+        "device": DEVICE,
+        "compile_model": COMPILE_MODEL,
+        "gradient_checkpointing": GRADIENT_CHECKPOINTING,
+        "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+        "seed": SEED,
+        "log_every_tokens": LOG_EVERY_TOKENS,
+        "val_every_iterations": VAL_EVERY_ITERATIONS,
+        "val_max_iterations": VAL_MAX_ITERATIONS,
+        "n_epochs": N_EPOCHS,
+        "checkpoint_dir": str(CHECKPOINT_DIR),
+        "init_from": str(INIT_FROM) if INIT_FROM is not None else None,
+        "resume_from": str(RESUME_FROM) if RESUME_FROM is not None else None,
         "wandb": {
-            "enabled": config.wandb.enabled,
-            "project": config.wandb.project,
-            "run_name": config.wandb.run_name,
-            "mode": config.wandb.mode,
+            "enabled": WANDB_ENABLED,
+            "project": WANDB_PROJECT,
+            "run_name": WANDB_RUN_NAME,
+            "mode": WANDB_MODE,
         },
     }
 
 
-def as_mapping(value: Any, name: str) -> dict[str, Any]:
-    """
-    Assert that a YAML-parsed value is a dict and return it.
-
-    Args:
-        value (Any): The value to check.
-        name (str): Human-readable name of the value, used in the error
-            message.
-
-    Returns:
-        dict[str, Any]: The value cast to a dict.
-
-    Raises:
-        ValueError: If value is not a dict.
-    """
-    if not isinstance(value, dict):
-        raise ValueError(f"{name} must be a YAML mapping")
-    return value
+def model_config_to_dict(language_model: LanguageModel) -> dict[str, int | float | None]:
+    """Serialize input LanguageModel config to a dictionary"""
+    return {
+        "vocab_size": language_model.vocab_size,
+        "sequence_length": language_model.sequence_length,
+        "embedding_dim": language_model.embedding_dim,
+        "n_decoder_blocks": language_model.n_decoder_blocks,
+        "n_heads": language_model.n_heads,
+        "n_kv_heads": language_model.n_kv_heads,
+        "ffn_hidden_dim": language_model.ffn_hidden_dim,
+        "dropout_rate": language_model.dropout_rate,
+    }
 
 
-def load_training_config(config_path: Path) -> TrainingConfig:
-    """
-    Parse and return a TrainingConfig from a YAML file.
-
-    Missing keys fall back to their documented defaults.
-
-    Args:
-        config_path (Path): Path to the YAML training configuration file.
-
-    Returns:
-        TrainingConfig: The parsed training configuration.
-    """
+def load_training_config(config_path: Path) -> None:
+    """Parse config YAML file and create global training config variables"""
     with config_path.open("r", encoding="utf-8") as config_file:
         raw_config = yaml.safe_load(config_file)
 
-    root = as_mapping(raw_config, "The training config file")
-    training = as_mapping(root.get("training", root), "training")
-    wandb_config = as_mapping(training.get("wandb", {}), "training.wandb")
+    assert isinstance(raw_config, dict), "Invalid YAML mapping"
+    training_config = raw_config["training"]
+    assert isinstance(training_config, dict), "Invalid YAML mapping"
+    wandb_config = training_config["wandb"]
+    assert isinstance(wandb_config, dict), "Invalid YAML mapping"
 
-    return TrainingConfig(
-        data_dir=Path(training.get("data_dir", "./data/tokenized")),
-        model_config=Path(training.get("model_config", "./configs/model.yaml")),
-        tokenizer_encoding=str(training.get("tokenizer_encoding", "cl100k_base")),
-        batch_size=int(training.get("batch_size", 4)),
-        learning_rate=float(training.get("learning_rate", 3e-4)),
-        min_learning_rate=float(training.get("min_learning_rate", 3e-5)),
-        lr_warmup_iterations=int(training.get("lr_warmup_iterations", 0)),
-        max_iterations=(
-            None
-            if training.get("max_iterations") is None
-            else int(training["max_iterations"])
-        ),
-        weight_decay=float(training.get("weight_decay", 0.01)),
-        max_grad_norm=training.get("max_grad_norm", 1.0),
-        device=str(training.get("device", "auto")),
-        compile_model=bool(training.get("compile_model", False)),
-        gradient_checkpointing=bool(training.get("gradient_checkpointing", False)),
-        gradient_accumulation_steps=int(training.get("gradient_accumulation_steps", 1)),
-        seed=int(training.get("seed", 42)),
-        log_every_tokens=int(training.get("log_every_tokens", 2048)),
-        val_every_iterations=int(training.get("val_every_iterations", 500)),
-        val_max_iterations=(
-            None
-            if training.get("val_max_iterations") is None
-            else int(training["val_max_iterations"])
-        ),
-        n_epochs=int(training.get("n_epochs", 1)),
-        checkpoint_dir=Path(training.get("checkpoint_dir", "./checkpoints")),
-        init_from=(
-            Path(training["init_from"])
-            if training.get("init_from") is not None
-            else None
-        ),
-        resume_from=(
-            Path(training["resume_from"])
-            if training.get("resume_from") is not None
-            else None
-        ),
-        wandb=WandbConfig(
-            enabled=bool(wandb_config.get("enabled", True)),
-            project=str(wandb_config.get("project", "piccolo")),
-            run_name=wandb_config.get("run_name"),
-            mode=str(wandb_config.get("mode", "online")),
-        ),
-    )
+    global DATA_DIR, MODEL_CONFIG, TOKENIZER_ENCODING, BATCH_SIZE, LEARNING_RATE
+    global MIN_LEARNING_RATE, LR_WARMUP_ITERATIONS, MAX_ITERATIONS, WEIGHT_DECAY
+    global MAX_GRAD_NORM, DEVICE, COMPILE_MODEL, GRADIENT_CHECKPOINTING
+    global GRADIENT_ACCUMULATION_STEPS, SEED, LOG_EVERY_TOKENS, VAL_EVERY_ITERATIONS
+    global VAL_MAX_ITERATIONS, N_EPOCHS, CHECKPOINT_DIR, INIT_FROM, RESUME_FROM
+    global WANDB_ENABLED, WANDB_PROJECT, WANDB_RUN_NAME, WANDB_MODE, WANDB_RESUME_ID
 
+    if (_v := training_config.get("data_dir", None)) is None:
+        raise ValueError("Missing 'data_dir' in training config file")
+    DATA_DIR = Path(_v)
 
-def validate_config(config: TrainingConfig) -> None:
-    """
-    Raise if any field in the training config violates its constraint.
+    if (_v := training_config.get("model_config", None)) is None:
+        raise ValueError("Missing 'model_config' in training config file")
+    MODEL_CONFIG = Path(_v)
 
-    Args:
-        config (TrainingConfig): The configuration to validate.
+    if (_v := training_config.get("tokenizer_encoding", None)) is None:
+        raise ValueError("Missing 'tokenizer_encoding' in training config file")
+    TOKENIZER_ENCODING = str(_v)
 
-    Raises:
-        ValueError: If any field is out of range or logically inconsistent.
-    """
-    if config.batch_size <= 0:
+    if (_v := training_config.get("batch_size", None)) is None:
+        raise ValueError("Missing 'batch_size' in training config file")
+    BATCH_SIZE = int(_v)
+
+    if (_v := training_config.get("learning_rate", None)) is None:
+        raise ValueError("Missing 'learning_rate' in training config file")
+    LEARNING_RATE = float(_v)
+
+    if (_v := training_config.get("min_learning_rate", None)) is None:
+        raise ValueError("Missing 'min_learning_rate' in training config file")
+    MIN_LEARNING_RATE = float(_v)
+
+    if (_v := training_config.get("lr_warmup_iterations", None)) is None:
+        raise ValueError("Missing 'lr_warmup_iterations' in training config file")
+    LR_WARMUP_ITERATIONS = int(_v)
+
+    _v = training_config.get("max_iterations", None)
+    MAX_ITERATIONS = None if _v is None else int(_v)
+
+    if (_v := training_config.get("weight_decay", None)) is None:
+        raise ValueError("Missing 'weight_decay' in training config file")
+    WEIGHT_DECAY = float(_v)
+
+    MAX_GRAD_NORM = training_config.get("max_grad_norm", None)
+
+    if (_v := training_config.get("device", None)) is None:
+        raise ValueError("Missing 'device' in training config file")
+    DEVICE = str(_v)
+
+    if (_v := training_config.get("compile_model", None)) is None:
+        raise ValueError("Missing 'compile_model' in training config file")
+    COMPILE_MODEL = bool(_v)
+
+    if (_v := training_config.get("gradient_checkpointing", None)) is None:
+        raise ValueError("Missing 'gradient_checkpointing' in training config file")
+    GRADIENT_CHECKPOINTING = bool(_v)
+
+    if (_v := training_config.get("gradient_accumulation_steps", None)) is None:
+        raise ValueError("Missing 'gradient_accumulation_steps' in training config file")
+    GRADIENT_ACCUMULATION_STEPS = int(_v)
+
+    if (_v := training_config.get("seed", None)) is None:
+        raise ValueError("Missing 'seed' in training config file")
+    SEED = int(_v)
+
+    if (_v := training_config.get("log_every_tokens", None)) is None:
+        raise ValueError("Missing 'log_every_tokens' in training config file")
+    LOG_EVERY_TOKENS = int(_v)
+
+    if (_v := training_config.get("val_every_iterations", None)) is None:
+        raise ValueError("Missing 'val_every_iterations' in training config file")
+    VAL_EVERY_ITERATIONS = int(_v)
+
+    _v = training_config.get("val_max_iterations", None)
+    VAL_MAX_ITERATIONS = None if _v is None else int(_v)
+
+    if (_v := training_config.get("n_epochs", None)) is None:
+        raise ValueError("Missing 'n_epochs' in training config file")
+    N_EPOCHS = int(_v)
+
+    if (_v := training_config.get("checkpoint_dir", None)) is None:
+        raise ValueError("Missing 'checkpoint_dir' in training config file")
+    CHECKPOINT_DIR = Path(_v)
+
+    _v = training_config.get("init_from", None)
+    INIT_FROM = Path(_v) if _v is not None else None
+
+    _v = training_config.get("resume_from", None)
+    RESUME_FROM = Path(_v) if _v is not None else None
+
+    if (_v := wandb_config.get("enabled", None)) is None:
+        raise ValueError("Missing 'enabled' in wandb config")
+    WANDB_ENABLED = bool(_v)
+
+    if WANDB_ENABLED:
+        if (_v := wandb_config.get("project", None)) is None:
+            raise ValueError("Missing 'project' in wandb config")
+        WANDB_PROJECT = str(_v)
+        WANDB_RUN_NAME = wandb_config.get("run_name", None)
+        if (_v := wandb_config.get("mode", None)) is None:
+            raise ValueError("Missing 'mode' in wandb config")
+        WANDB_MODE = str(_v)
+        WANDB_RESUME_ID = wandb_config.get("resume_id", None)
+    else:
+        WANDB_PROJECT = None
+        WANDB_RUN_NAME = None
+        WANDB_MODE = None
+        WANDB_RESUME_ID = None
+
+def validate_config_vars() -> None:
+    """Check global training variables"""
+    if BATCH_SIZE <= 0:
         raise ValueError("batch_size must be greater than 0")
-    if config.learning_rate <= 0:
+    if LEARNING_RATE <= 0:
         raise ValueError("learning_rate must be greater than 0")
-    if config.min_learning_rate < 0:
+    if MIN_LEARNING_RATE < 0:
         raise ValueError("min_learning_rate must be greater than or equal to 0")
-    if config.min_learning_rate > config.learning_rate:
+    if MIN_LEARNING_RATE > LEARNING_RATE:
         raise ValueError("min_learning_rate must be less than or equal to learning_rate")
-    if config.lr_warmup_iterations < 0:
+    if LR_WARMUP_ITERATIONS < 0:
         raise ValueError("lr_warmup_iterations must be greater than or equal to 0")
-    if config.max_iterations is not None and config.max_iterations <= 0:
+    if MAX_ITERATIONS is not None and MAX_ITERATIONS <= 0:
         raise ValueError("max_iterations must be greater than 0 when configured")
-    if config.max_iterations is not None and config.max_iterations <= config.lr_warmup_iterations:
+    if MAX_ITERATIONS is not None and MAX_ITERATIONS <= LR_WARMUP_ITERATIONS:
         raise ValueError("max_iterations must be greater than lr_warmup_iterations")
-    if config.weight_decay < 0:
+    if WEIGHT_DECAY < 0:
         raise ValueError("weight_decay must be greater than or equal to 0")
-    if config.max_grad_norm is not None and config.max_grad_norm <= 0:
+    if MAX_GRAD_NORM is not None and MAX_GRAD_NORM <= 0:
         raise ValueError("max_grad_norm must be greater than 0 when configured")
-    if config.log_every_tokens <= 0:
+    if LOG_EVERY_TOKENS <= 0:
         raise ValueError("log_every_tokens must be greater than 0")
-    if config.val_every_iterations <= 0:
+    if VAL_EVERY_ITERATIONS <= 0:
         raise ValueError("val_every_iterations must be greater than 0")
-    if config.val_max_iterations is not None and config.val_max_iterations <= 0:
+    if VAL_MAX_ITERATIONS is not None and VAL_MAX_ITERATIONS <= 0:
         raise ValueError("val_max_iterations must be greater than 0 when configured")
-    if config.gradient_accumulation_steps < 1:
+    if GRADIENT_ACCUMULATION_STEPS < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
-    if config.n_epochs < 1:
+    if N_EPOCHS < 1:
         raise ValueError("n_epochs must be at least 1")
-    if config.init_from is not None and not config.init_from.is_file():
-        raise ValueError(f"init_from path does not exist: {config.init_from}")
-    if config.resume_from is not None and not config.resume_from.is_file():
-        raise ValueError(f"resume_from path does not exist: {config.resume_from}")
-    if config.init_from is not None and config.resume_from is not None:
+    if INIT_FROM is not None and not INIT_FROM.is_file():
+        raise ValueError(f"init_from path does not exist: {INIT_FROM}")
+    if RESUME_FROM is not None and not RESUME_FROM.is_file():
+        raise ValueError(f"resume_from path does not exist: {RESUME_FROM}")
+    if INIT_FROM is not None and RESUME_FROM is not None:
         raise ValueError("init_from and resume_from are mutually exclusive")
-
-
-def resolve_device(requested_device: str) -> torch.device:
-    """
-    Resolve a device string to a torch.device.
-
-    Args:
-        requested_device (str): Device string from the training config.
-            Pass ``"auto"`` to automatically select CUDA when available.
-
-    Returns:
-        torch.device: The resolved compute device.
-
-    Raises:
-        ValueError: If ``"cuda"`` is requested but CUDA is not available.
-    """
-    if requested_device == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-
-    device = torch.device(requested_device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested but is not available")
-    if device.type == "mps" and not torch.backends.mps.is_available():
-        raise ValueError("MPS was requested but is not available")
-
-    return device
-
-
-def seed_everything(seed: int) -> None:
-    """
-    Set all relevant random seeds for reproducible training.
-
-    Args:
-        seed (int): The integer seed applied to Python, PyTorch, and CUDA RNGs.
-    """
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    
 
 
 def get_learning_rate(
-    config: TrainingConfig,
     iteration: int,
     max_iterations: int | None = None,
 ) -> float:
-    """
-    Compute the learning rate for a given training iteration.
+    """Compute the learning rate for a given training iteration."""
+    assert iteration > 0, "Iteration must be greater than 0"
 
-    Applies linear warm-up from 0 to ``learning_rate`` over
-    ``lr_warmup_iterations`` steps, then cosine decay to
-    ``min_learning_rate`` over the remaining iterations.
+    if LR_WARMUP_ITERATIONS > 0 and iteration <= LR_WARMUP_ITERATIONS:
+        return LEARNING_RATE * iteration / LR_WARMUP_ITERATIONS
 
-    Args:
-        config (TrainingConfig): Training configuration holding the LR
-            schedule parameters.
-        iteration (int): Current training step (1-indexed).
-        max_iterations (int | None): Override for the total number of
-            training steps used to compute the cosine decay horizon.
-            When None, falls back to ``config.max_iterations``.  Pass
-            ``effective_max_iterations`` here when training with epochs
-            so the LR decays over the full multi-epoch span.
-
-    Returns:
-        float: The learning rate to use at this iteration.
-
-    Raises:
-        ValueError: If iteration is not positive.
-    """
-    if iteration <= 0:
-        raise ValueError("iteration must be greater than 0")
-
-    if config.lr_warmup_iterations > 0 and iteration <= config.lr_warmup_iterations:
-        return config.learning_rate * iteration / config.lr_warmup_iterations
-
-    effective_max = max_iterations if max_iterations is not None else config.max_iterations
+    effective_max = max_iterations if max_iterations is not None else MAX_ITERATIONS
     if effective_max is None:
-        return config.learning_rate
+        return LEARNING_RATE
 
-    decay_iterations = effective_max - config.lr_warmup_iterations
-    decay_iteration = max(iteration - config.lr_warmup_iterations - 1, 0)
+    decay_iterations = effective_max - LR_WARMUP_ITERATIONS
+    decay_iteration = max(iteration - LR_WARMUP_ITERATIONS - 1, 0)
     decay_progress = min(decay_iteration / decay_iterations, 1.0)
     cosine_multiplier = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
-    return config.min_learning_rate + cosine_multiplier * (
-        config.learning_rate - config.min_learning_rate
+    return MIN_LEARNING_RATE + cosine_multiplier * (
+        LEARNING_RATE - MIN_LEARNING_RATE
     )
 
 
 def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
-    """
-    Update the learning rate in all optimizer parameter groups.
-
-    Args:
-        optimizer (torch.optim.Optimizer): The optimizer to update.
-        learning_rate (float): New learning rate value.
-    """
+    """Update the learning rate in all optimizer parameter groups."""
     for parameter_group in optimizer.param_groups:
         parameter_group["lr"] = learning_rate
 
 
-def build_logger(
-    config: TrainingConfig,
-    model_config: ModelConfig,
-    resume_run_id: str | None = None,
-) -> MetricsLogger:
-    """
-    Construct the appropriate metrics logger based on the training config.
-
-    Args:
-        config (TrainingConfig): Training configuration; inspects
-            ``config.wandb.enabled`` to choose the logger type.
-        model_config (ModelConfig): Model configuration passed to the W&B
-            logger for metadata logging.
-        resume_run_id (str | None): W&B run ID to resume. Forwarded to
-            WandbMetricsLogger when W&B is enabled.
-
-    Returns:
-        MetricsLogger: A WandbMetricsLogger if W&B is enabled, otherwise the
-            no-op MetricsLogger.
-    """
-    if config.wandb.enabled:
-        return WandbMetricsLogger(config.wandb, config, model_config, resume_run_id)
-    return MetricsLogger()
-
-
 def reset_inference_state(language_model: torch.nn.Module) -> None:
-    """
-    Reset the KV-cache and token counter on the transformer decoder.
-
-    Called between validation sequences to prevent context bleed across
-    independent sequences during inference. Handles compiled models
-    (``_orig_mod``) transparently.
-
-    Args:
-        language_model (torch.nn.Module): The language model whose internal
-            decoder state should be reset.
-    """
+    """Reset the KV-cache and token counter on the transformer decoder."""
     model = getattr(language_model, "_orig_mod", language_model)
-    transformer_decoder = getattr(model, "transformer_decoder", None)
-    if transformer_decoder is None:
-        return
+    transformer_decoder: TransformerDecoder = getattr(model, "transformer_decoder", None)
+    assert transformer_decoder is not None, "Invalid LanguageModel instance, transformer_decoder is None."
 
     transformer_decoder.global_token_counter = 0
     transformer_decoder.kv_cache.clear()
-
-
-def load_checkpoint(
-    path: Path,
-    language_model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-) -> tuple[int, int, float, float]:
-    """
-    Load a training checkpoint and restore model, optimizer, and scaler state.
-
-    Args:
-        path (Path): Path to the checkpoint file.
-        language_model (torch.nn.Module): Model to restore weights into.
-        optimizer (torch.optim.Optimizer): Optimizer to restore state into.
-        scaler (torch.amp.GradScaler): Grad scaler to restore state into.
-
-    Returns:
-        tuple[int, int, float, float]: ``(optimizer_steps, train_tokens_seen,
-            best_val_loss, train_token_loss)`` read from the checkpoint.
-    """
-    checkpoint = torch.load(path, weights_only=True)
-    model = getattr(language_model, "_orig_mod", language_model)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scaler.load_state_dict(checkpoint["scaler_state_dict"])
-    return (
-        checkpoint["optimizer_steps"],
-        checkpoint["train_tokens_seen"],
-        checkpoint["val_loss"],
-        checkpoint.get("train_token_loss", 0.0),
-        checkpoint.get("wandb_run_id"),
-    )
 
 
 def save_checkpoint(
@@ -529,25 +274,7 @@ def save_checkpoint(
     val_loss: float,
     wandb_run_id: str | None = None,
 ) -> None:
-    """
-    Save a training checkpoint to disk.
-
-    Unwraps compiled models (``_orig_mod``) before saving so the checkpoint
-    contains plain module state and can be loaded without torch.compile.
-
-    Args:
-        path (Path): Destination file path; parent directories are created
-            automatically.
-        language_model (torch.nn.Module): The model whose parameters are saved.
-        optimizer (torch.optim.Optimizer): The optimizer whose state is saved.
-        scaler (torch.amp.GradScaler): The gradient scaler whose state is saved.
-        optimizer_steps (int): Number of optimizer steps completed.
-        train_tokens_seen (int): Total training tokens processed so far.
-        train_token_loss (float): Cumulative sum of (loss * tokens) used to
-            compute the running average training loss.
-        val_loss (float): Validation loss at this checkpoint; use
-            ``float("nan")`` when no validation was run.
-    """
+    """Save a training checkpoint to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     model = getattr(language_model, "_orig_mod", language_model)
     torch.save(
@@ -567,29 +294,13 @@ def save_checkpoint(
 
 def validate(
     language_model: torch.nn.Module,
-    dataset: TokenizedDataset | FinetuneDataset,
+    dataset: TokenizedPreTrainingDataset | TokenizedFinetuneDataset,
     device: torch.device,
     amp_dtype: torch.dtype,
     use_amp: bool,
     max_iterations: int | None = None,
 ) -> float | None:
-    """
-    Run a validation pass and return the mean per-token loss.
-
-    Args:
-        language_model (torch.nn.Module): The model to evaluate (set to eval
-            mode internally).
-        dataset (TokenizedDataset): Dataset whose validation split is read.
-        device (torch.device): Device that tensors are moved to.
-        amp_dtype (torch.dtype): dtype used inside the autocast region.
-        use_amp (bool): Whether to enable automatic mixed precision.
-        max_iterations (int | None): Maximum number of batches to evaluate.
-            When None the validation split is consumed fully.
-
-    Returns:
-        float | None: Mean per-token cross-entropy loss over the evaluated
-            batches, or None if no validation batches were produced.
-    """
+    """Run a validation pass and return the mean per-token loss."""
     dataset.reset_split("val")
     language_model.eval()
     total_token_loss = 0.0
@@ -631,79 +342,89 @@ def validate(
     return total_token_loss / total_tokens
 
 
-def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
-    """Run the full pre-training loop from a TrainingConfig.
+def train(training_type: str) -> None:
+    """Run the full pre-training or SFT"""
+    validate_config_vars()
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
-    Validates the config, initialises the model, optimizer, and dataset,
-    then iterates over sequential batches. Logs metrics periodically and
-    runs a full validation pass at the end.
+    
+    if not DATA_DIR.is_dir():
+        raise ValueError(f"{DATA_DIR} is not a valid data directory")
 
-    Args:
-        config (TrainingConfig): Complete training configuration.
+    if DEVICE == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
 
-    Raises:
-        ValueError: If config validation fails or the data directory is
-            missing.
-    """
-    validate_config(config)
-    seed_everything(config.seed)
+    device = torch.device(DEVICE)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is not available")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS was requested but is not available")
 
-    data_dir = config.data_dir
-    if not data_dir.is_dir():
-        raise ValueError(f"{data_dir} is not a valid data directory")
-
-    device = resolve_device(config.device)
     amp_dtype = get_supported_weights_precision(device)
     use_amp = device.type == "cuda"
     use_grad_scaler = use_amp and amp_dtype == torch.float16
     torch.set_float32_matmul_precision("high")
 
-    model_config = ModelConfig.from_yaml(config.model_config)
-    tokenizer = TiktokenTokenizer(config.tokenizer_encoding)
-    tokenizer_vocab_size = tokenizer.tokenizer.n_vocab
-    if model_config.vocab_size < tokenizer_vocab_size:
-        raise ValueError(
-            "model.vocab_size must be greater than or equal to the tokenizer "
-            f"vocabulary size ({tokenizer_vocab_size})"
-        )
+    tokenizer = TiktokenTokenizer(TOKENIZER_ENCODING)
 
     language_model: torch.nn.Module = LanguageModel.from_config(
-        model_config,
+        MODEL_CONFIG,
         kv_cache={},
         device=device,
-        gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing=GRADIENT_CHECKPOINTING,
     ).to(device)
-    language_model = compile_language_model(language_model, enabled=config.compile_model)
+
+    if language_model.vocab_size < tokenizer.tokenizer.n_vocab:
+        raise ValueError(
+            "Model's vocab size must be greater than or equal to the tokenizer "
+            f"vocabulary size ({tokenizer.tokenizer.n_vocab})"
+        )
+    
+    if COMPILE_MODEL:
+        language_model = cast(torch.nn.Module, torch.compile(language_model))
 
     optimizer = torch.optim.AdamW(
         language_model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
     scaler = torch.amp.GradScaler(device.type, enabled=use_grad_scaler)
 
     optimizer_steps = 0
     train_tokens_seen = 0
-    next_log_tokens = config.log_every_tokens
+    next_log_tokens = LOG_EVERY_TOKENS
     best_val_loss = float("inf")
     wandb_run_id: str | None = None
 
-    if config.init_from is not None:
+    if INIT_FROM is not None:
         # Load only the model weights from a prior checkpoint (e.g. a
         # pre-trained model used as the starting point for SFT).
         # Optimizer state, step counters, and W&B run ID are intentionally
         # NOT restored so the new training phase starts from a clean slate.
-        print(f"Initialising weights from {config.init_from} …")
-        checkpoint = torch.load(config.init_from, map_location="cpu", weights_only=True)
+        print(f"Initialising weights from {INIT_FROM}...")
+        checkpoint = torch.load(INIT_FROM, map_location="cpu", weights_only=True)
         model = getattr(language_model, "_orig_mod", language_model)
         model.load_state_dict(checkpoint["model_state_dict"])
         del checkpoint
 
-    if config.resume_from is not None:
-        optimizer_steps, train_tokens_seen, best_val_loss, _, wandb_run_id = load_checkpoint(
-            config.resume_from, language_model, optimizer, scaler
-        )
-        next_log_tokens = (train_tokens_seen // config.log_every_tokens + 1) * config.log_every_tokens
+    if RESUME_FROM is not None:
+        checkpoint = torch.load(RESUME_FROM, weights_only=True)
+        model = getattr(language_model, "_orig_mod", language_model)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        optimizer_steps = checkpoint["optimizer_steps"]
+        train_tokens_seen = checkpoint["train_tokens_seen"]
+        best_val_loss = checkpoint["val_loss"]
+        wandb_run_id = checkpoint.get("wandb_run_id")
+        next_log_tokens = (train_tokens_seen // LOG_EVERY_TOKENS + 1) * LOG_EVERY_TOKENS
         # LR is restored after effective_max_iterations is computed below.
 
     # Track loss/tokens from this run's start so avg_loss is always meaningful,
@@ -713,95 +434,80 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
     ema_loss: float | None = None
     ema_alpha = 0.98
 
-    logger = build_logger(config, model_config, resume_run_id=wandb_resume_id or wandb_run_id)
+    if wandb_run_id is None:
+        wandb_run_id = WANDB_RESUME_ID
+
+    wandb_current_run = None
+    if WANDB_ENABLED:
+        wandb_current_run = wandb.init(project=WANDB_PROJECT,
+                                    name=WANDB_RUN_NAME,
+                                    mode=WANDB_MODE,
+                                    id=WANDB_RESUME_ID or wandb_run_id,
+                                    resume="must" if wandb_run_id is not None else None,
+                                    config={
+                                        "training": training_config_to_dict(),
+                                        "model": model_config_to_dict(language_model)
+                                        }
+        )
+
+    # When resuming, skip any step already present in the run so we never
+    # log backwards and trigger a step-ordering error from W&B.
+    skip_until_step: int = 0
+    if WANDB_ENABLED and wandb_run_id is not None and wandb_current_run is not None:
+        skip_until_step = int(wandb_current_run.summary.get("train/tokens_seen", 0))
 
     try:
-        # ── Dataset auto-detection ───────────────────────────────────────────
-        # Finetune datasets carry per-sample offset index files alongside the
-        # flat token binary.  Pre-training datasets are flat binary streams
-        # with no offset files.
-        is_finetune = (data_dir / "train_offsets.npy").exists()
-
-        if is_finetune:
-            train_dataset: TokenizedDataset | FinetuneDataset = FinetuneDataset(
-                data_dir=data_dir,
-                sequence_length=model_config.sequence_length,
-                batch_size=config.batch_size,
+        if training_type == "sft":
+            dataset: TokenizedPreTrainingDataset | TokenizedFinetuneDataset = TokenizedFinetuneDataset(
+                data_dir=DATA_DIR,
+                sequence_length=language_model.sequence_length,
+                batch_size=BATCH_SIZE,
                 pad_token_id=tokenizer.get_end_token(),
                 split="train",
-                seed=config.seed,
+                seed=SEED,
             )
-            val_dataset: TokenizedDataset | FinetuneDataset = FinetuneDataset(
-                data_dir=data_dir,
-                sequence_length=model_config.sequence_length,
-                batch_size=config.batch_size,
-                pad_token_id=tokenizer.get_end_token(),
-                split="val",
-                seed=config.seed,
-            )
-            assert isinstance(train_dataset, FinetuneDataset)
+            assert isinstance(dataset, TokenizedFinetuneDataset)
             n_optimizer_steps_per_epoch = max(
-                train_dataset.n_samples // (config.batch_size * config.gradient_accumulation_steps),
+                dataset.n_samples["train"] // (BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS),
                 1,
             )
-            computed_max = config.n_epochs * n_optimizer_steps_per_epoch
+            computed_max = N_EPOCHS * n_optimizer_steps_per_epoch
             effective_max_iterations: int | None = (
-                min(config.max_iterations, computed_max)
-                if config.max_iterations is not None
+                min(MAX_ITERATIONS, computed_max)
+                if MAX_ITERATIONS is not None
                 else computed_max
             )
         else:
-            _tok_dataset = TokenizedDataset(
-                data_dir=data_dir,
-                sequence_length=model_config.sequence_length,
-                batch_size=config.batch_size,
+            dataset = TokenizedPreTrainingDataset(
+                data_dir=DATA_DIR,
+                sequence_length=language_model.sequence_length,
+                batch_size=BATCH_SIZE,
             )
-            if config.resume_from is not None:
+
+            if RESUME_FROM is not None:
                 # Restore position within the current epoch for seamless resume.
-                _tok_dataset._offset["train"] = train_tokens_seen
-            train_dataset = _tok_dataset
-            val_dataset = _tok_dataset
-            if config.max_iterations is not None:
-                effective_max_iterations = config.max_iterations
-            elif config.n_epochs > 1:
-                n_train_tokens = len(_tok_dataset._mmap["train"])
+                dataset._offset["train"] = train_tokens_seen
+            
+            if MAX_ITERATIONS is not None:
+                effective_max_iterations = MAX_ITERATIONS
+            elif N_EPOCHS > 1:
+                n_train_tokens = len(dataset._mmap["train"])
                 tokens_per_step = (
-                    config.batch_size
-                    * model_config.sequence_length
-                    * config.gradient_accumulation_steps
+                    BATCH_SIZE
+                    * language_model.sequence_length
+                    * GRADIENT_ACCUMULATION_STEPS
                 )
                 n_optimizer_steps_per_epoch = max(n_train_tokens // tokens_per_step, 1)
-                effective_max_iterations = config.n_epochs * n_optimizer_steps_per_epoch
+                effective_max_iterations = N_EPOCHS * n_optimizer_steps_per_epoch
             else:
                 effective_max_iterations = None
 
         # Now that effective_max_iterations is known, restore LR for resumed runs.
-        if config.resume_from is not None:
+        if RESUME_FROM is not None:
             set_optimizer_learning_rate(
                 optimizer,
-                get_learning_rate(config, optimizer_steps, effective_max_iterations),
+                get_learning_rate(optimizer_steps, effective_max_iterations),
             )
-
-        # ── Helpers ──────────────────────────────────────────────────────────
-        def _reset_epoch(epoch: int) -> None:
-            if is_finetune:
-                # Use a per-epoch seed derived from the base seed so each epoch
-                # sees a different sample order.
-                train_dataset.reset_epoch(seed=config.seed + epoch)  # type: ignore[union-attr]
-            else:
-                train_dataset.reset_split("train")  # type: ignore[union-attr]
-
-        def _run_validation() -> float | None:
-            result = validate(
-                language_model=language_model,
-                dataset=val_dataset,
-                device=device,
-                amp_dtype=amp_dtype,
-                use_amp=use_amp,
-                max_iterations=config.val_max_iterations,
-            )
-            language_model.train()
-            return result
 
         progress = tqdm(
             desc="\033[1mTraining\033[0m",
@@ -810,18 +516,19 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             initial=train_tokens_seen,
         )
 
-        # ── Epoch loop ───────────────────────────────────────────────────────
-        for epoch in range(1, config.n_epochs + 1):
+        for epoch in range(1, N_EPOCHS + 1):
             # On a resumed pre-training run the data offset is already set
             # above; skip the reset so we continue from where we left off.
             # For all other cases (epoch > 1, or finetune), do the reset.
             skip_reset = (
-                config.resume_from is not None
+                RESUME_FROM is not None
                 and epoch == 1
-                and not is_finetune
+                and training_type == "pretraining"
             )
             if not skip_reset:
-                _reset_epoch(epoch)
+                # Use a per-epoch seed derived from the base seed so each epoch
+                # sees a different sample order.
+                dataset.reset_epoch(seed=SEED + epoch)
 
             while True:
                 # Honour an explicit max_iterations hard cap if set.
@@ -829,7 +536,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                 # stopping mechanism; effective_max_iterations is used only
                 # for LR scheduling and must not be the stopping criterion
                 # (it is a floor-rounded estimate and can be off by n_epochs).
-                if config.max_iterations is not None and optimizer_steps >= config.max_iterations:
+                if MAX_ITERATIONS is not None and optimizer_steps >= MAX_ITERATIONS:
                     break
 
                 optimizer.zero_grad(set_to_none=True)
@@ -837,41 +544,44 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                 tokens_in_optimizer_step = 0
                 epoch_ended = False
 
-                for _ in range(config.gradient_accumulation_steps):
+                for _ in range(GRADIENT_ACCUMULATION_STEPS):
                     try:
-                        inputs, targets = train_dataset.get_sequential_batch("train")  # type: ignore[union-attr]
+                        inputs, targets = dataset.get_sequential_batch("train")
                     except StopIteration:
                         epoch_ended = True
                         break
                     tokens_in_micro_batch = inputs.numel()
-                    micro_loss = forward_backward_micro_step(
-                        language_model=language_model,
-                        scaler=scaler,
-                        inputs=inputs,
-                        targets=targets,
-                        device=device,
-                        amp_dtype=amp_dtype,
-                        use_amp=use_amp,
-                        loss_scale=1.0 / config.gradient_accumulation_steps,
-                    )
-                    accumulated_loss += micro_loss
+                    language_model.train()
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                        loss = language_model(inputs, targets=targets)
+
+                    # Scaling is only needed for CUDA float16. With bfloat16 or CPU,
+                    # GradScaler is disabled and these calls are no-ops/pass-throughs.
+                    
+                    # Multiplies the loss by loss_scale before backpropagation; set
+                    # loss_scale = 1 / gradient_accumulation_steps so gradients average
+                    # correctly across an accumulation window.
+                    loss_scale = 1 / GRADIENT_ACCUMULATION_STEPS
+                    scaler.scale(loss * loss_scale).backward()
+
+                    accumulated_loss += float(loss.detach().item())
                     tokens_in_optimizer_step += tokens_in_micro_batch
 
                 # Flush any partial accumulation collected before epoch end.
                 if tokens_in_optimizer_step > 0:
                     optimizer_steps += 1
                     learning_rate = get_learning_rate(
-                        config, optimizer_steps, effective_max_iterations
+                        optimizer_steps, effective_max_iterations
                     )
                     set_optimizer_learning_rate(optimizer, learning_rate)
-                    optimizer_step(
-                        language_model=language_model,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        max_grad_norm=config.max_grad_norm,
-                    )
+                    if MAX_GRAD_NORM is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(language_model.parameters(), max_norm=MAX_GRAD_NORM)
+                    scaler.step(optimizer)
+                    scaler.update()
 
-                    loss = accumulated_loss / config.gradient_accumulation_steps
+                    loss = accumulated_loss / GRADIENT_ACCUMULATION_STEPS
                     train_tokens_seen += tokens_in_optimizer_step
                     train_token_loss += loss * tokens_in_optimizer_step
                     avg_train_loss = train_token_loss / (train_tokens_seen - initial_tokens_seen)
@@ -882,34 +592,44 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                     progress.update(tokens_in_optimizer_step)
                     progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
 
-                    if train_tokens_seen >= next_log_tokens:
-                        logger.log(
-                            {
-                                "train/loss": loss,
-                                "train/loss_ema": ema_loss,
-                                "train/avg_loss": avg_train_loss,
-                                "train/tokens_seen": train_tokens_seen,
-                                "train/optimizer_steps": optimizer_steps,
-                                "train/learning_rate": learning_rate,
-                            },
-                            step=train_tokens_seen,
-                        )
-                        while next_log_tokens <= train_tokens_seen:
-                            next_log_tokens += config.log_every_tokens
-
-                    if optimizer_steps % config.val_every_iterations == 0:
-                        step_val_loss = _run_validation()
-                        if step_val_loss is not None:
-                            logger.log(
-                                {
-                                    "val/loss": step_val_loss,
+                    if train_tokens_seen >= next_log_tokens and train_tokens_seen > skip_until_step:
+                        if WANDB_ENABLED:
+                            wandb_current_run.log(
+                                data={
+                                    "train/loss": loss,
+                                    "train/loss_ema": ema_loss,
+                                    "train/avg_loss": avg_train_loss,
                                     "train/tokens_seen": train_tokens_seen,
                                     "train/optimizer_steps": optimizer_steps,
+                                    "train/learning_rate": learning_rate,
                                 },
                                 step=train_tokens_seen,
                             )
+                        while next_log_tokens <= train_tokens_seen:
+                            next_log_tokens += LOG_EVERY_TOKENS
+
+                    if optimizer_steps % VAL_EVERY_ITERATIONS == 0:
+                        step_val_loss = validate(
+                            language_model=language_model,
+                            dataset=dataset,
+                            device=device,
+                            amp_dtype=amp_dtype,
+                            use_amp=use_amp,
+                            max_iterations=VAL_MAX_ITERATIONS,
+                        )
+                        language_model.train()
+                        if step_val_loss is not None:
+                            if WANDB_ENABLED and train_tokens_seen > skip_until_step:
+                                wandb_current_run.log(
+                                    data={
+                                        "val/loss": step_val_loss,
+                                        "train/tokens_seen": train_tokens_seen,
+                                        "train/optimizer_steps": optimizer_steps,
+                                    },
+                                    step=train_tokens_seen,
+                                )
                             save_checkpoint(
-                                path=config.checkpoint_dir / "checkpoint_val_last.pt",
+                                path=CHECKPOINT_DIR / "checkpoint_val_last.pt",
                                 language_model=language_model,
                                 optimizer=optimizer,
                                 scaler=scaler,
@@ -917,12 +637,12 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                                 train_tokens_seen=train_tokens_seen,
                                 train_token_loss=train_token_loss,
                                 val_loss=step_val_loss,
-                                wandb_run_id=logger.run_id,
+                                wandb_run_id=wandb_current_run.id if wandb_current_run is not None else None,
                             )
                             if step_val_loss < best_val_loss:
                                 best_val_loss = step_val_loss
                                 save_checkpoint(
-                                    path=config.checkpoint_dir / "checkpoint_best.pt",
+                                    path=CHECKPOINT_DIR / "checkpoint_best.pt",
                                     language_model=language_model,
                                     optimizer=optimizer,
                                     scaler=scaler,
@@ -930,15 +650,15 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
                                     train_tokens_seen=train_tokens_seen,
                                     train_token_loss=train_token_loss,
                                     val_loss=step_val_loss,
-                                    wandb_run_id=logger.run_id,
+                                    wandb_run_id=wandb_current_run.id if wandb_current_run is not None else None,
                                 )
 
                 if epoch_ended:
                     # Log epoch completion and break out of the while loop so
                     # the outer for loop can advance to the next epoch.
-                    if config.n_epochs > 1:
-                        logger.log(
-                            {
+                    if WANDB_ENABLED and N_EPOCHS > 1 and train_tokens_seen > skip_until_step:
+                        wandb_current_run.log(
+                            data={
                                 "train/epoch": epoch,
                                 "train/tokens_seen": train_tokens_seen,
                             },
@@ -948,21 +668,29 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
 
         progress.close()
 
-        if train_tokens_seen > 0:
-            logger.log(
-                {
+        if WANDB_ENABLED and train_tokens_seen > 0 and train_tokens_seen > skip_until_step:
+            wandb_current_run.log(
+                data={
                     "train/final_loss": train_token_loss / train_tokens_seen,
                     "train/tokens_seen": train_tokens_seen,
                     "train/optimizer_steps": optimizer_steps,
-                    "train/learning_rate": get_learning_rate(config, optimizer_steps, effective_max_iterations),
+                    "train/learning_rate": get_learning_rate(optimizer_steps, effective_max_iterations),
                 },
                 step=train_tokens_seen,
             )
 
-        final_val_loss = _run_validation()
-        if final_val_loss is not None:
-            logger.log(
-                {
+        final_val_loss = validate(
+            language_model=language_model,
+            dataset=dataset,
+            device=device,
+            amp_dtype=amp_dtype,
+            use_amp=use_amp,
+            max_iterations=VAL_MAX_ITERATIONS,
+        )
+        language_model.train()
+        if WANDB_ENABLED and final_val_loss is not None and max(train_tokens_seen, 1) > skip_until_step:
+            wandb_current_run.log(
+                data={
                     "val/loss": final_val_loss,
                     "train/tokens_seen": train_tokens_seen,
                     "train/optimizer_steps": optimizer_steps,
@@ -971,7 +699,7 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             )
 
         save_checkpoint(
-            path=config.checkpoint_dir / "checkpoint_final.pt",
+            path=CHECKPOINT_DIR / "checkpoint_final.pt",
             language_model=language_model,
             optimizer=optimizer,
             scaler=scaler,
@@ -979,20 +707,15 @@ def train(config: TrainingConfig, wandb_resume_id: str | None = None) -> None:
             train_tokens_seen=train_tokens_seen,
             train_token_loss=train_token_loss,
             val_loss=final_val_loss if final_val_loss is not None else float("nan"),
-            wandb_run_id=logger.run_id,
+            wandb_run_id=wandb_current_run.id if wandb_current_run is not None else None,
         )
     finally:
-        logger.finish()
+        if wandb_current_run is not None:
+            wandb_current_run.finish()
 
 
 def parse_args() -> argparse.Namespace:
-    """
-    Parse command-line arguments for the training entry point.
-
-    Returns:
-        argparse.Namespace: Parsed arguments with a ``config`` field holding
-            the path to the YAML training configuration.
-    """
+    """Parse command-line arguments for the training entry point."""
     parser = argparse.ArgumentParser(description="Train the piccolo language model.")
     parser.add_argument(
         "--config",
@@ -1001,32 +724,16 @@ def parse_args() -> argparse.Namespace:
         help="Path to the YAML training config.",
     )
     parser.add_argument(
-        "--init-from",
-        type=Path,
-        default=None,
-        help="Path to a checkpoint whose model weights initialise this run "
-             "(optimizer state and step counters are reset — use for SFT).",
-    )
-    parser.add_argument(
-        "--resume-from",
-        type=Path,
-        default=None,
-        help="Path to a checkpoint to resume training from.",
-    )
-    parser.add_argument(
-        "--wandb-resume-id",
+        "--training-type",
         type=str,
-        default=None,
-        help="W&B run ID to resume (overrides the run ID stored in the checkpoint).",
+        choices=["pretraining", "sft"],
+        default="pratraining",
+        help="Type of the training to run (Pre-training or SFT)",
     )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    config = load_training_config(args.config)
-    if args.init_from is not None:
-        config = dataclasses.replace(config, init_from=args.init_from)
-    if args.resume_from is not None:
-        config = dataclasses.replace(config, resume_from=args.resume_from)
-    train(config, wandb_resume_id=args.wandb_resume_id)
+    load_training_config(args.config)
+    train(args.training_type)
