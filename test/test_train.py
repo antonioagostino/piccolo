@@ -81,7 +81,7 @@ def test_train_runs_from_yaml_config(tmp_path: Path):
         encoding="utf-8",
     )
 
-    train(load_training_config(training_config_path))
+    train("pretraining", load_training_config(training_config_path))
 
 
 def test_learning_rate_uses_warmup_then_cosine_decay(tmp_path: Path):
@@ -118,11 +118,11 @@ def test_learning_rate_uses_warmup_then_cosine_decay(tmp_path: Path):
     )
     config = load_training_config(training_config_path)
 
-    assert get_learning_rate(1) == pytest.approx(0.5)
-    assert get_learning_rate(2) == pytest.approx(1.0)
-    assert get_learning_rate(3) == pytest.approx(1.0)
-    assert get_learning_rate(5) == pytest.approx(0.55)
-    assert get_learning_rate(7) == pytest.approx(0.1)
+    assert get_learning_rate(config, 1) == pytest.approx(0.5)
+    assert get_learning_rate(config, 2) == pytest.approx(1.0)
+    assert get_learning_rate(config, 3) == pytest.approx(1.0)
+    assert get_learning_rate(config, 5) == pytest.approx(0.55)
+    assert get_learning_rate(config, 7) == pytest.approx(0.1)
 
 
 def test_tokenized_dataset_token_counts_match_metadata(tmp_path: Path):
