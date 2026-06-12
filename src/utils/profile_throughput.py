@@ -1,41 +1,16 @@
-"""
-MFU profiler for pre-tokenized training data.
-
-Measures end-to-end effective throughput (memmap batch read +
-GPU forward+backward) and reports Model Flop Utilization (MFU).
-
-torch.compile() warmup: the first forward pass triggers JIT compilation
-and is not representative. Use --n-warmup (default 20) to skip enough
-iterations before timing begins. With compile the warmup phase will take
-noticeably longer — this is expected, not a hang.
-
-Usage:
-    python -m src.utils.profile_throughput \\
-        --config configs/training.yaml \\
-        --n-warmup 20 \\
-        --n-batches 100
-"""
-from __future__ import annotations
-
+from typing import cast
 import argparse
 import time
 from pathlib import Path
 
 import torch
 
-from src.dataset import TokenizedDataset
-from src.train import load_training_config, resolve_device
+from src.dataset import TokenizedPreTrainingDataset
+from src.train import load_training_config, validate_config, validate_device
 from src.transformer import (
     LanguageModel,
-    ModelConfig,
-    compile_language_model,
-    forward_backward_micro_step,
     get_supported_weights_precision,
 )
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants and helpers
-# ──────────────────────────────────────────────────────────────────────────────
 
 GPU_TFLOPS: dict[str, float] = {
     "A100_40GB": 312.0,
@@ -47,89 +22,93 @@ GPU_TFLOPS: dict[str, float] = {
     "V100_FP16":  14.0,
 }
 
-
-def _sync(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-
-
-def _fmt(value: float) -> str:
+def format_output(value: float) -> str:
     for threshold, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
         if value >= threshold:
             return f"{value / threshold:.2f}{suffix}"
     return f"{value:.2f}"
 
-
-def _next_batch(dataset: TokenizedDataset, split: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the next batch, resetting the split cursor if exhausted."""
-    try:
-        return dataset.get_sequential_batch(split)
-    except StopIteration:
-        dataset.reset_split(split)
-        return dataset.get_sequential_batch(split)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Core measurement
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _run(
-    model: torch.nn.Module,
-    scaler: torch.amp.GradScaler,
-    dataset: TokenizedDataset,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-    use_amp: bool,
+def profile_throughput(
+    config_path: Path,
     n_warmup: int,
     n_batches: int,
-    compiled: bool,
-) -> float:
-    """
-    Return mean wall-clock seconds per training step (memmap read + fwd + bwd).
-
-    Warmup iterations are run first and excluded from timing. When
-    torch.compile is active, the first several warmup steps trigger JIT
-    compilation; subsequent steps settle to the compiled speed.
-    """
-    label = "warmup (compile + CUDA)" if compiled else "warmup"
-    print(f"  Running {n_warmup} {label} iterations …", flush=True)
-
-    for _ in range(n_warmup):
-        model.zero_grad(set_to_none=True)
-        x, y = _next_batch(dataset, "train")
-        x, y = x.to(device), y.to(device)
-        forward_backward_micro_step(model, scaler, x, y, device, amp_dtype, use_amp)
-        scaler.update()
-    _sync(device)
-
-    print(f"  Timing {n_batches} iterations …", flush=True)
-    t0 = time.perf_counter()
-    for _ in range(n_batches):
-        model.zero_grad(set_to_none=True)
-        x, y = _next_batch(dataset, "train")
-        x, y = x.to(device), y.to(device)
-        forward_backward_micro_step(model, scaler, x, y, device, amp_dtype, use_amp)
-        scaler.update()
-    _sync(device)
-
-    return (time.perf_counter() - t0) / n_batches
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Report
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _report(
-    *,
-    model: torch.nn.Module,
-    model_config: ModelConfig,
     gpu: str | None,
-    tokens_per_batch: int,
-    step_s: float,
-    compiled: bool,
     target_tokens: float,
 ) -> None:
-    n_params = sum(p.numel() for p in model.parameters())
+    config = load_training_config(config_path)
+    validate_config(config)
+    device = validate_device(config["device"])
+    amp_dtype = get_supported_weights_precision(device)
+    use_amp = device.type == "cuda"
+    use_scaler = use_amp and amp_dtype == torch.float16
+    torch.set_float32_matmul_precision("high")
+
+    language_model: LanguageModel = LanguageModel.from_config(
+        config["model_config"],
+        kv_cache={},
+        device=device,
+        gradient_checkpointing=config["gradient_checkpointing"],
+    ).to(device)
+
+    if config["compile_model"]:
+        language_model = cast(LanguageModel, torch.compile(language_model))
+    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
+
+    dataset = TokenizedPreTrainingDataset(
+        data_dir=config["data_dir"],
+        sequence_length=language_model.sequence_length,
+        batch_size=config["batch_size"],
+    )
+
+    print("Start profiling...")
+
+    for _ in range(n_warmup):
+        language_model.zero_grad(set_to_none=True)
+        try:
+            x, y = dataset.get_sequential_batch("train")
+        except StopIteration:
+            dataset.reset_split("train")
+            x, y = dataset.get_sequential_batch("train")
+
+        x, y = x.to(device), y.to(device)
+        language_model.train()
+        inputs, targets = inputs.to(device), targets.to(device)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            loss = language_model(inputs, targets=targets)
+
+        loss_scale = 1 / config["gradient_accumulation_steps"]
+        scaler.scale(loss * loss_scale).backward()
+        scaler.update()
+    
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(n_batches):
+        language_model.zero_grad(set_to_none=True)
+        try:
+            x, y = dataset.get_sequential_batch("train")
+        except StopIteration:
+            dataset.reset_split("train")
+            x, y = dataset.get_sequential_batch("train")
+
+        x, y = x.to(device), y.to(device)
+        language_model.train()
+        inputs, targets = inputs.to(device), targets.to(device)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            loss = language_model(inputs, targets=targets)
+
+        loss_scale = 1 / config["gradient_accumulation_steps"]
+        scaler.scale(loss * loss_scale).backward()
+        scaler.update()
+    
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    step_s = (time.perf_counter() - t0) / n_batches
+
+    tokens_per_batch = config["batch_size"] * language_model.sequence_length
+    n_params = sum(p.numel() for p in language_model.parameters())
     flops_per_token = 6 * n_params
 
     throughput = tokens_per_batch / step_s
@@ -143,94 +122,26 @@ def _report(
 
     hours = target_tokens / throughput / 3600
 
-    print()
-    print("=" * 56)
-    print("  MFU PROFILE")
-    print("=" * 56)
-    print(f"  Model parameters  : {_fmt(n_params)} ({n_params:,})")
-    print(f"  Tokens per batch  : {_fmt(tokens_per_batch)}")
-    print(f"  torch.compile     : {'yes' if compiled else 'no'}")
-    print(f"  GPU               : {gpu or 'unknown'}")
-    print()
-    print(f"  Step time         : {step_s * 1e3:,.1f} ms")
-    print(f"  Throughput        : {_fmt(throughput)} tok/s")
+    print(f"Model parameters: {format_output(n_params)} ({n_params:,})")
+    print(f"Tokens per batch: {format_output(tokens_per_batch)}")
+    print(f"torch.compile: {'yes' if config["compile_model"] else 'no'}")
+    print(f"GPU: {gpu or 'unknown'}")
+    print(f"Step time: {step_s * 1e3:,.1f} ms")
+    print(f"Throughput: {format_output(throughput)} tok/s")
     if mfu is not None:
-        print(f"  MFU               : {mfu:.1f}%")
+        print(f"MFU: {mfu:.1f}%")
     print()
-    print(f"  Time to train {_fmt(target_tokens)} tokens : {hours:,.0f} h  ({hours / 24:.1f} days)")
-    print("=" * 56)
-    print()
+    print(f"Time to train {format_output(target_tokens)} tokens : {hours:,.0f} h  ({hours / 24:.1f} days)")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
-
-def profile_throughput(
-    config_path: Path,
-    n_warmup: int,
-    n_batches: int,
-    gpu: str | None,
-    target_tokens: float,
-) -> None:
-    config       = load_training_config(config_path)
-    model_config = ModelConfig.from_yaml(config.model_config)
-    device       = resolve_device(config.device)
-    amp_dtype    = get_supported_weights_precision(device)
-    use_amp      = device.type == "cuda"
-    use_scaler   = use_amp and amp_dtype == torch.float16
-    torch.set_float32_matmul_precision("high")
-
-    print(f"\nLoading tokenized dataset from {config.data_dir} …")
-    dataset = TokenizedDataset(
-        data_dir=config.data_dir,
-        sequence_length=model_config.sequence_length,
-        batch_size=config.batch_size,
-    )
-
-    print(f"Building model on {device} …")
-    model: torch.nn.Module = LanguageModel.from_config(
-        model_config, kv_cache={}, device=device,
-        gradient_checkpointing=config.gradient_checkpointing,
-    ).to(device)
-    model = compile_language_model(model, enabled=config.compile_model)
-    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
-
-    print("Profiling …")
-    step_s = _run(
-        model=model,
-        scaler=scaler,
-        dataset=dataset,
-        device=device,
-        amp_dtype=amp_dtype,
-        use_amp=use_amp,
-        n_warmup=n_warmup,
-        n_batches=n_batches,
-        compiled=config.compile_model,
-    )
-
-    tokens_per_batch = config.batch_size * model_config.sequence_length
-    _report(
-        model=model,
-        model_config=model_config,
-        gpu=gpu,
-        tokens_per_batch=tokens_per_batch,
-        step_s=step_s,
-        compiled=config.compile_model,
-        target_tokens=target_tokens,
-    )
-
-
-def _parse_args() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Profile effective MFU on pre-tokenized training data."
+        description="Compute effective MFU using pre-training tokenized data."
     )
     parser.add_argument("--config", type=Path, default=Path("configs/training.yaml"))
     parser.add_argument(
         "--n-warmup", type=int, default=20,
         help=(
             "Iterations to run before timing starts. "
-            "Covers torch.compile JIT and CUDA kernel warm-up. "
             "Increase to 50+ if compile is enabled and the first report looks too slow."
         ),
     )
@@ -250,5 +161,5 @@ def _parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    args = _parse_args()
+    args = parse_args()
     profile_throughput(args.config, args.n_warmup, args.n_batches, args.gpu, args.target_tokens)

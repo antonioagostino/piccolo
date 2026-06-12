@@ -2,7 +2,7 @@ import argparse
 import math
 import random
 from pathlib import Path
-from typing import Any, Union, cast
+from typing import Any, cast
 
 import torch
 import yaml
@@ -262,6 +262,23 @@ def reset_inference_state(language_model: torch.nn.Module) -> None:
     transformer_decoder.global_token_counter = 0
     transformer_decoder.kv_cache.clear()
 
+def validate_device(desired_device: str) -> torch.device:
+    if desired_device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            return torch.device("mps")
+        else:
+            return torch.device("cpu")
+    else:
+        device = torch.device(desired_device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA was requested but is not available")
+        if device.type == "mps" and not torch.backends.mps.is_available():
+            raise ValueError("MPS was requested but is not available")
+        
+        return device
+
 
 def save_checkpoint(
     path: Path,
@@ -353,20 +370,7 @@ def train(training_type: str, config: dict[str, Any]) -> None:
     if not config["data_dir"].is_dir():
         raise ValueError(f"{config['data_dir']} is not a valid data directory")
 
-    if config["device"] == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(config["device"])
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise ValueError("CUDA was requested but is not available")
-        if device.type == "mps" and not torch.backends.mps.is_available():
-            raise ValueError("MPS was requested but is not available")
-
+    device = validate_device(config["device"])
     amp_dtype = get_supported_weights_precision(device)
     use_amp = device.type == "cuda"
     use_grad_scaler = use_amp and amp_dtype == torch.float16
