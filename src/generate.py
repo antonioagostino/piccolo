@@ -54,7 +54,7 @@ def sample_next_token(
 
 
 def generate(config_file: Path,
-             checkpoint: Path,
+             checkpoint_path: Path,
              max_new_tokens: int,
              temperature: float,
              top_k: int,
@@ -69,7 +69,7 @@ def generate(config_file: Path,
 
     print(f"Loading checkpoint from {args.checkpoint}...")
     model = LanguageModel.from_config(config["model_config"], kv_cache={}, device=device)
-    checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
