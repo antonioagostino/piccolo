@@ -17,6 +17,34 @@ from src.transformer import (
     get_supported_weights_precision,
 )
 
+DATA_DIR: Path
+MODEL_CONFIG: Path
+TOKENIZER_ENCODING: str
+BATCH_SIZE: int
+LEARNING_RATE: float
+MIN_LEARNING_RATE: float
+LR_WARMUP_ITERATIONS: int
+MAX_ITERATIONS: int | None
+WEIGHT_DECAY: float
+MAX_GRAD_NORM: float | None
+DEVICE: str
+COMPILE_MODEL: bool
+GRADIENT_CHECKPOINTING: bool
+GRADIENT_ACCUMULATION_STEPS: int
+SEED: int
+LOG_EVERY_TOKENS: int
+VAL_EVERY_ITERATIONS: int
+VAL_MAX_ITERATIONS: int | None
+N_EPOCHS: int
+CHECKPOINT_DIR: Path
+INIT_FROM: Path | None
+RESUME_FROM: Path | None
+WANDB_ENABLED: bool
+WANDB_PROJECT: str | None
+WANDB_RUN_NAME: str | None
+WANDB_MODE: str | None
+WANDB_RESUME_ID: str | None
+
 
 def training_config_to_dict() -> dict[str, Any]:
     """Serialise global training config variables to a plain dict."""
@@ -256,7 +284,7 @@ def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate:
 def reset_inference_state(language_model: torch.nn.Module) -> None:
     """Reset the KV-cache and token counter on the transformer decoder."""
     model = getattr(language_model, "_orig_mod", language_model)
-    transformer_decoder: TransformerDecoder = getattr(model, "transformer_decoder", None)
+    transformer_decoder: TransformerDecoder | None = getattr(model, "transformer_decoder", None)
     assert transformer_decoder is not None, "Invalid LanguageModel instance, transformer_decoder is None."
 
     transformer_decoder.global_token_counter = 0
@@ -356,16 +384,17 @@ def train(training_type: str) -> None:
 
     if DEVICE == "auto":
         if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-
-    device = torch.device(DEVICE)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested but is not available")
-    if device.type == "mps" and not torch.backends.mps.is_available():
-        raise ValueError("MPS was requested but is not available")
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(DEVICE)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA was requested but is not available")
+        if device.type == "mps" and not torch.backends.mps.is_available():
+            raise ValueError("MPS was requested but is not available")
 
     amp_dtype = get_supported_weights_precision(device)
     use_amp = device.type == "cuda"
@@ -374,7 +403,7 @@ def train(training_type: str) -> None:
 
     tokenizer = TiktokenTokenizer(TOKENIZER_ENCODING)
 
-    language_model: torch.nn.Module = LanguageModel.from_config(
+    language_model: LanguageModel = LanguageModel.from_config(
         MODEL_CONFIG,
         kv_cache={},
         device=device,
@@ -388,7 +417,7 @@ def train(training_type: str) -> None:
         )
     
     if COMPILE_MODEL:
-        language_model = cast(torch.nn.Module, torch.compile(language_model))
+        language_model = cast(LanguageModel, torch.compile(language_model))
 
     optimizer = torch.optim.AdamW(
         language_model.parameters(),
@@ -441,7 +470,7 @@ def train(training_type: str) -> None:
     if WANDB_ENABLED:
         wandb_current_run = wandb.init(project=WANDB_PROJECT,
                                     name=WANDB_RUN_NAME,
-                                    mode=WANDB_MODE,
+                                    mode=WANDB_MODE,  # type: ignore[arg-type]
                                     id=WANDB_RESUME_ID or wandb_run_id,
                                     resume="must" if wandb_run_id is not None else None,
                                     config={
@@ -463,7 +492,6 @@ def train(training_type: str) -> None:
                 sequence_length=language_model.sequence_length,
                 batch_size=BATCH_SIZE,
                 pad_token_id=tokenizer.get_end_token(),
-                split="train",
                 seed=SEED,
             )
             assert isinstance(dataset, TokenizedFinetuneDataset)
@@ -593,7 +621,7 @@ def train(training_type: str) -> None:
                     progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
 
                     if train_tokens_seen >= next_log_tokens and train_tokens_seen > skip_until_step:
-                        if WANDB_ENABLED:
+                        if WANDB_ENABLED and wandb_current_run is not None:
                             wandb_current_run.log(
                                 data={
                                     "train/loss": loss,
@@ -619,7 +647,7 @@ def train(training_type: str) -> None:
                         )
                         language_model.train()
                         if step_val_loss is not None:
-                            if WANDB_ENABLED and train_tokens_seen > skip_until_step:
+                            if WANDB_ENABLED and wandb_current_run is not None and train_tokens_seen > skip_until_step:
                                 wandb_current_run.log(
                                     data={
                                         "val/loss": step_val_loss,
@@ -656,7 +684,7 @@ def train(training_type: str) -> None:
                 if epoch_ended:
                     # Log epoch completion and break out of the while loop so
                     # the outer for loop can advance to the next epoch.
-                    if WANDB_ENABLED and N_EPOCHS > 1 and train_tokens_seen > skip_until_step:
+                    if WANDB_ENABLED and wandb_current_run is not None and N_EPOCHS > 1 and train_tokens_seen > skip_until_step:
                         wandb_current_run.log(
                             data={
                                 "train/epoch": epoch,
@@ -668,7 +696,7 @@ def train(training_type: str) -> None:
 
         progress.close()
 
-        if WANDB_ENABLED and train_tokens_seen > 0 and train_tokens_seen > skip_until_step:
+        if WANDB_ENABLED and wandb_current_run is not None and train_tokens_seen > 0 and train_tokens_seen > skip_until_step:
             wandb_current_run.log(
                 data={
                     "train/final_loss": train_token_loss / train_tokens_seen,
@@ -688,7 +716,7 @@ def train(training_type: str) -> None:
             max_iterations=VAL_MAX_ITERATIONS,
         )
         language_model.train()
-        if WANDB_ENABLED and final_val_loss is not None and max(train_tokens_seen, 1) > skip_until_step:
+        if WANDB_ENABLED and wandb_current_run is not None and final_val_loss is not None and max(train_tokens_seen, 1) > skip_until_step:
             wandb_current_run.log(
                 data={
                     "val/loss": final_val_loss,
