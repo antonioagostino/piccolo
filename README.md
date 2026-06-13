@@ -1,6 +1,6 @@
 # Piccolo
 
-A ~300M parameter decoder-only transformer pretrained from scratch on Italian text (CulturaX), then fine-tuned on Italian instruction data (Alpaca GPT-4 Italian). The architecture is modern but conventional: GQA, SwiGLU, RoPE, RMSNorm, tied embeddings. Everything is implemented in plain PyTorch — no HuggingFace Transformers.
+A ~300M parameter decoder-only transformer pretrained from scratch on Italian text (CulturaX), then fine-tuned on Italian instruction data (Alpaca GPT-4 Italian). The architecture is modern but conventional: GQA, SwiGLU, RoPE, RMSNorm, tied embeddings. Everything is implemented in plain PyTorch (no HuggingFace Transformers).
 
 ## Architecture
 
@@ -20,7 +20,7 @@ A ~300M parameter decoder-only transformer pretrained from scratch on Italian te
 
 **FFN.** SwiGLU: a single fused projection to `2 × ffn_hidden_dim`, chunked into two halves, then `SiLU(x1) * x2` projected back to `embedding_dim`.
 
-**Position encoding.** RoPE with interleaved even/odd rotation (the original Su et al. 2022 formulation). This differs from the half-split convention used in LLaMA/GPT-NeoX — both are valid RoPE formulations, but weights trained with one are not compatible with the other.
+**Position encoding.** RoPE with interleaved even/odd rotation (the original Su et al. 2022 formulation). This differs from the half-split convention used in LLaMA/GPT-NeoX (both are valid RoPE formulations, but weights trained with one are not compatible with the other).
 
 **Loss.** Chunked cross-entropy: hidden states are projected to logits in chunks of 1024 tokens to avoid materializing the full `(B×T, vocab_size)` tensor on the GPU.
 
@@ -38,7 +38,7 @@ A ~300M parameter decoder-only transformer pretrained from scratch on Italian te
 
 ### Pretraining validation loss
 
-![Pretraining val loss](assets/pretrain_val_loss.png)
+![Pretraining val loss](assets/pretraining_val_loss.png)
 
 Validation loss decreases steadily across training with no signs of divergence or instability.
 
@@ -52,7 +52,7 @@ Validation loss decreases across both epochs with the expected steeper drop in t
 
 All examples below were generated with `--temperature 0.8 --top-k 50 --top-p 0.95 --repetition-penalty 1.2`.
 
-**Working well — common factual questions:**
+**Working well (common factual questions):**
 
 The model answers correctly and produces fluent Italian. The population figure that follows is plausible but fabricated (see next section).
 
@@ -64,27 +64,27 @@ Human: Che popolazione ha Roma?
 Model: L'area della città di Roma è composta da circa 1,4 milioni di abitanti.
 ```
 
-**Factual hallucination — confidently wrong, plausible-sounding specifics:**
+**Factual hallucination (confidently wrong, plausible-sounding specifics):**
 
-The Morocco answer is wrong (Rabat is the capital, not Marrakech). The Rome population figures also contradict each other across two turns — 1.5M in the first response, 1.4M in the second — both invented. The model is not uncertain; it commits to specific, authoritative-sounding numbers.
+The Morocco answer is wrong (Rabat is the capital, not Marrakech). The Rome population figures also contradict each other across two turns (1.5M in the first response, 1.4M in the second), both invented. The model is not uncertain; it commits to specific, authoritative-sounding numbers.
 
 ```
 Human: Qual è la capitale del Marocco?
 Model: La capitale del Marocco è Marrakech.
 ```
 
-**Fabricated detail — inventing language and vocabulary:**
+**Fabricated detail (inventing language and vocabulary):**
 
-This is qualitatively different from a simple factual error. The model does not just name the wrong language — it invents a word (`kamalakh`) and assigns it a meaning, presented as fact. This is a distinct failure mode: not getting a known fact wrong, but generating entirely fictitious information with confident phrasing.
+This is qualitatively different from a simple factual error. The model does not just name the wrong language (it invents a word (`kamalakh`) and assigns it a meaning, presented as fact). This is a distinct failure mode: not getting a known fact wrong, but generating entirely fictitious information with confident phrasing.
 
 ```
 Human: Che lingua si parla in India?
 Model: La lingua indiana è parlata in India, con la parola "kamalakh" che significa letteratura.
 ```
 
-**Instruction following — list quality:**
+**Instruction following (list quality):**
 
-With these sampling parameters, token-level repetition (the main failure at low temperature with no repetition penalty) is largely resolved: the model produces 5 distinct items. However the instruction said 4, and the items themselves are a mix of correct entries (Sushi), plausible but oddly phrased entries ("Tazza di noodles di soia" for ramen), and outright garbled ones ("Bokkaido o patatine fritte" — not a real dish). Sampling parameters can fix repetition; they cannot fix instruction-following precision or factual knowledge, which are capability limitations at this scale.
+With these sampling parameters, token-level repetition (the main failure at low temperature with no repetition penalty) is largely resolved: the model produces 5 distinct items. However the instruction said 4, and the items themselves are a mix of correct entries (Sushi), plausible but oddly phrased entries ("Tazza di noodles di soia" for ramen), and outright garbled ones ("Bokkaido o patatine fritte", not a real dish). Sampling parameters can fix repetition; they cannot fix instruction-following precision or factual knowledge, which are capability limitations at this scale.
 
 ```
 Human: Mi scrivi i 4 piatti giapponesi più famosi?
@@ -97,7 +97,7 @@ Model: 1. Tazza di noodles di soia
 
 **Known limitations:**
 
-- **No loss masking on SFT.** Cross-entropy is computed over the full sequence including the instruction tokens, not just the model response. This is a deliberate tradeoff — simpler training at the cost of some training efficiency. See the [original InstructGPT paper](https://arxiv.org/abs/2203.02155) for context on why masking matters.
+- **No loss masking on SFT.** Cross-entropy is computed over the full sequence including the instruction tokens, not just the model response. This is a deliberate tradeoff (simpler training at the cost of some training efficiency). See the [original InstructGPT paper](https://arxiv.org/abs/2203.02155) for context on why masking matters.
 
 - **No multi-turn context in chat.** The `chat.py` script resets KV-cache and token history on every turn. The SFT dataset contains only single-turn examples, so the model was never trained to handle context carried across turns.
 
@@ -115,7 +115,7 @@ Requires Python 3.10+ and PyTorch 2.10+. Training was done with CUDA; CPU is sup
 
 ### 2. Download and tokenize the pretraining dataset
 
-CulturaX is gated on HuggingFace — you need an accepted-terms account and a token.
+CulturaX is gated on HuggingFace (you need an accepted-terms account and a token).
 
 ```bash
 python -m src.utils.download_dataset \
