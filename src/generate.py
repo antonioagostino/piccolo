@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 from src.tokenizer import TiktokenTokenizer
 from src.train import load_training_config, validate_device
@@ -15,7 +14,7 @@ def generate(config_file: Path,
              max_new_tokens: int,
              temperature: float,
              top_k: int,
-             top_p: int,
+             top_p: float,
              repetition_penalty: float) -> None:
     config = load_training_config(config_file)
     device = validate_device(config["device"])

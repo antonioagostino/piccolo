@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 from src.tokenizer import TiktokenTokenizer
 from src.train import load_training_config, validate_device

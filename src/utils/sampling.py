@@ -31,7 +31,7 @@ def sample_next_token(
         cutoff = torch.topk(logits, k).values[-1]
         logits[logits < cutoff] = float("-inf")
 
-    # Nucleulus
+    # Nucleus
     if top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)

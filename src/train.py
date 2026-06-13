@@ -372,7 +372,7 @@ def train(training_type: str, config: dict[str, Any]) -> None:
 
     device = validate_device(config["device"])
     amp_dtype = get_supported_weights_precision(device)
-    use_amp = device.type == "cuda"
+    use_amp = device.type in ("cuda", "mps")
     use_grad_scaler = use_amp and amp_dtype == torch.float16
     torch.set_float32_matmul_precision("high")
 
