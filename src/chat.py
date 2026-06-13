@@ -44,7 +44,8 @@ def sample_next_token(
     if top_p < 1.0:
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        sorted_to_remove = (cumulative_probs - F.softmax(sorted_logits, dim=-1)) >= top_p
+        sorted_to_remove = (cumulative_probs - F.softmax(sorted_logits, dim=-1)) > top_p
+        sorted_to_remove[0] = False
         sorted_logits[sorted_to_remove] = float("-inf")
         logits.scatter_(0, sorted_indices, sorted_logits)
 
@@ -53,13 +54,13 @@ def sample_next_token(
     
 
 
-def generate(config_file: Path,
-             checkpoint_path: Path,
-             max_new_tokens: int,
-             temperature: float,
-             top_k: int,
-             top_p: int,
-             repetition_penalty: float) -> None:
+def chat(config_file: Path,
+         checkpoint_path: Path,
+         max_new_tokens: int,
+         temperature: float,
+         top_k: int,
+         top_p: float,
+         repetition_penalty: float) -> None:
     config = load_training_config(config_file)
     device = validate_device(config["device"])
     amp_dtype = get_supported_weights_precision(device)
@@ -67,70 +68,70 @@ def generate(config_file: Path,
     tokenizer = TiktokenTokenizer(config["tokenizer_encoding"])
     eos_id = tokenizer.get_end_token()
 
-    print(f"Loading checkpoint from {args.checkpoint}...")
+    print(f"Loading checkpoint from {checkpoint_path}...")
     model = LanguageModel.from_config(config["model_config"], kv_cache={}, device=device)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
 
-    prompt = input("Prompt: ")
-    if not prompt:
-        print("Empty prompt — exiting.", file=sys.stderr)
-        return
+    # Used for repetition penalty
+    past_ids: list[int]
+    generated: list[int]
+    prev_text: str
 
-    prompt_ids = tokenizer.encode(prompt)
-    if len(prompt_ids) >= model.sequence_length:
-        print(
-            f"Prompt is {len(prompt_ids)} tokens but the model's sequence length is "
-            f"{model.sequence_length}. Please use a shorter prompt.",
-            file=sys.stderr,
-        )
-        return
+    while True:
+        prompt = input("Human: ")
+        if not prompt:
+            print("Empty prompt — exiting.", file=sys.stderr)
+            return
 
-    # Move the cursor back up to the prompt line so generated tokens appear
-    # on the same line as the user's input rather than on a new one.
-    print(f"\033[1A\rPrompt: {prompt}", end="", flush=True)
+        prompt_ids = tokenizer.encode(f"Human: {prompt}\nModel:")
+        if len(prompt_ids) >= model.sequence_length:
+            print(
+                f"Prompt is {len(prompt_ids)} tokens but the model's sequence length is "
+                f"{model.sequence_length}. Please use a shorter prompt.",
+                file=sys.stderr,
+            )
+            return
 
-    with torch.no_grad():
-        model.transformer_decoder.global_token_counter = 0
-        model.transformer_decoder.kv_cache.clear()
+        with torch.no_grad():
+            model.transformer_decoder.global_token_counter = 0
+            model.transformer_decoder.kv_cache.clear()
+            past_ids = []
+            generated = []
+            prev_text = ""
 
-        # Used for repetition penalty
-        past_ids: list[int] = list(prompt_ids)
-
-        # KV-cache prefill
-        x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(x)  # (1, T_prompt, vocab_size)
-        next_token = sample_next_token(
-            logits[0, -1], past_ids, temperature, top_k, top_p, repetition_penalty
-        )
-
-        generated: list[int] = []
-        prev_text = ""
-
-        while next_token != eos_id and len(generated) < max_new_tokens:
-            generated.append(next_token)
-            past_ids.append(next_token)
-            new_text = tokenizer.decode(generated)
-            print(new_text[len(prev_text):], end="", flush=True)
-            prev_text = new_text
-
-            # Using KV-cache
-            x = torch.tensor([[next_token]], dtype=torch.long, device=device)
+            # KV-cache prefill
+            x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                logits = model(x)  # (1, 1, vocab_size)
+                logits = model(x)  # (1, T_prompt, vocab_size)
             next_token = sample_next_token(
                 logits[0, -1], past_ids, temperature, top_k, top_p, repetition_penalty
             )
+                
+            print("Model:", end="")
+            while next_token != eos_id and len(generated) < max_new_tokens:
+                generated.append(next_token)
+                past_ids.append(next_token)
+                new_text = tokenizer.decode(generated)
+                print(new_text[len(prev_text):], end="", flush=True)
+                prev_text = new_text
 
-        print()
+                # Using KV-cache
+                x = torch.tensor([[next_token]], dtype=torch.long, device=device)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    logits = model(x)  # (1, 1, vocab_size)
+                next_token = sample_next_token(
+                    logits[0, -1], past_ids, temperature, top_k, top_p, repetition_penalty
+                )
+
+            print()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Load a pre-trained model and generate sequences."
+        description="Chat with the finetuned language model."
     )
     parser.add_argument(
         "--checkpoint", type=Path, required=True,
@@ -141,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to the YAML training config.",
     )
     parser.add_argument(
-        "--max-new-tokens", type=int, default=200,
+        "--max-new-tokens", type=int, default=512,
         help="Maximum tokens to generate before stopping (default: 200).",
     )
     parser.add_argument(
@@ -167,10 +168,10 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    generate(args.config,
-             args.checkpoint,
-             args.max_new_tokens,
-             args.temperature,
-             args.top_k,
-             args.top_p,
-             args.repetition_penalty)
+    chat(args.config,
+         args.checkpoint,
+         args.max_new_tokens,
+         args.temperature,
+         args.top_k,
+         args.top_p,
+         args.repetition_penalty)
