@@ -30,6 +30,8 @@ A ~300M parameter decoder-only transformer pretrained from scratch on Italian te
 
 ## Training
 
+**Compute budget.** Model size and token count were chosen following the Chinchilla scaling laws (Hoffmann et al., 2022). The process: use the laws to get a rough parameter count and token budget -> measure actual throughput with `src/utils/profile_throughput.py` on the target hardware -> plug the real tokens/s into the compute formula to get accurate FLOPs -> solve for the Chinchilla-optimal (N, D) pair given that budget. The 300M parameter count and 5.9B token training run are the result of that calculation.
+
 **Pretraining** was run on a single A100 40GB for one epoch over a CulturaX Italian subset. Effective batch size: 18 sequences × 18 gradient accumulation steps × 2048 tokens ≈ 664K tokens per optimizer step, for 8906 steps total (~5.9B tokens). AdamW with lr 3e-4 decaying cosinely to 3e-5 (500 warmup steps), weight decay 0.01, grad norm clip 1.0. `torch.compile` enabled, gradient checkpointing off.
 
 **SFT** was run for 2 epochs on Alpaca GPT-4 Italian. Initialized from the pretrained checkpoint. lr 2e-5 decaying to 0 (no warmup), weight decay 0.1, same batch size, no gradient accumulation.
@@ -48,30 +50,50 @@ Validation loss decreases across both epochs with the expected steeper drop in t
 
 ## Examples and limitations
 
-The SFT model follows simple conversational instructions reasonably well for its size. Outputs are in Italian.
+All examples below were generated with `--temperature 0.8 --top-k 50 --top-p 0.95 --repetition-penalty 1.2`.
 
-**Working well — common knowledge:**
-```
-Human: Qual è la capitale d'Italia?
-Model: La capitale d'Italia è Roma.
-```
+**Working well — common factual questions:**
 
-**Failing — less common facts, hallucination and self-contradiction:**
-```
-Human: Qual è la capitale del Portogallo?
-Model: La capitale del Portogallo è Madrid.
+The model answers correctly and produces fluent Italian. The population figure that follows is plausible but fabricated (see next section).
 
-Human: Ma non è Lisbona?
-Model: Hai ragione, mi scuso. La capitale del Portogallo è Lisbona.
+```
+Human: Qual è la capitale dell'Italia?
+Model: La capitale dell'Italia è Roma, con una popolazione di circa un milione e mezzo di abitanti.
+
+Human: Che popolazione ha Roma?
+Model: L'area della città di Roma è composta da circa 1,4 milioni di abitanti.
 ```
 
-**Failing — repetition on long-form generation:**
+**Factual hallucination — confidently wrong, plausible-sounding specifics:**
+
+The Morocco answer is wrong (Rabat is the capital, not Marrakech). The Rome population figures also contradict each other across two turns — 1.5M in the first response, 1.4M in the second — both invented. The model is not uncertain; it commits to specific, authoritative-sounding numbers.
+
 ```
-Human: Dimmi 10 piatti tipici della cucina giapponese.
-Model: 1. Sushi 2. Ramen 3. Sushi 4. Ramen 5. Sushi 6. Tempura 7. Sushi 8. Ramen 9. Sushi 10. Sushi
+Human: Qual è la capitale del Marocco?
+Model: La capitale del Marocco è Marrakech.
 ```
 
-These are expected failure modes for a 300M model trained this way, not bugs.
+**Fabricated detail — inventing language and vocabulary:**
+
+This is qualitatively different from a simple factual error. The model does not just name the wrong language — it invents a word (`kamalakh`) and assigns it a meaning, presented as fact. This is a distinct failure mode: not getting a known fact wrong, but generating entirely fictitious information with confident phrasing.
+
+```
+Human: Che lingua si parla in India?
+Model: La lingua indiana è parlata in India, con la parola "kamalakh" che significa letteratura.
+```
+
+**Instruction following — list quality:**
+
+With these sampling parameters, token-level repetition (the main failure at low temperature with no repetition penalty) is largely resolved: the model produces 5 distinct items. However the instruction said 4, and the items themselves are a mix of correct entries (Sushi), plausible but oddly phrased entries ("Tazza di noodles di soia" for ramen), and outright garbled ones ("Bokkaido o patatine fritte" — not a real dish). Sampling parameters can fix repetition; they cannot fix instruction-following precision or factual knowledge, which are capability limitations at this scale.
+
+```
+Human: Mi scrivi i 4 piatti giapponesi più famosi?
+Model: 1. Tazza di noodles di soia
+2. Omelette al curry e zenzero
+3. Uova strapazzate
+4. Sushi o sushi in stile giapponese
+5. Bokkaido o patatine fritte
+```
 
 **Known limitations:**
 
