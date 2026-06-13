@@ -270,6 +270,11 @@ class TransformerDecoder(nn.Module):
                             use_gqa: bool = True) -> None:
         # During inference, if we are generating one token at time, in an
         # autoregressive mode, we need to compute new RoPE sin and cos.
+        # NOTE: the KV cache is truncated to sequence_length (sliding window),
+        # but the RoPE offset is derived from the KV cache length. Once total
+        # generated tokens exceed sequence_length the offset caps at sequence_length
+        # and new tokens receive the wrong positional encoding. Generation beyond
+        # the context window still works but quality degrades. It's a bug I've to solve.
         # (HS / 2)
         freqs = extend_token_pos * self.rope_freqs
 
