@@ -48,6 +48,13 @@ Validation loss decreases steadily across training with no signs of divergence o
 
 Validation loss decreases across both epochs with the expected steeper drop in the first.
 
+## Pretrained checkpoints
+
+- **Pretrained (base model)**: [download](https://drive.google.com/file/d/1lzE1EAq3rnv_AB4Ip2FeNKm0nmRb6C8y/view?usp=share_link) — use with `src/generate.py` and `configs/training.yaml`
+- **SFT (instruction-tuned)**: [download](https://drive.google.com/file/d/1qKei1nmFQ9YnTI7CIRI5xI8AroW3l5Zs/view?usp=share_link) — use with `src/chat.py` and `configs/training.yaml`
+
+Both are `.pt` files containing a `model_state_dict`, loadable as shown in the generation/chat commands above.
+
 ## Examples and limitations
 
 All examples below were generated with `--temperature 0.8 --top-k 50 --top-p 0.95 --repetition-penalty 1.2`.
